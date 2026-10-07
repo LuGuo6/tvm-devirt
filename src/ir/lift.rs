@@ -106,6 +106,22 @@ fn noreturn_import_slots(pe: &PeFile) -> Vec<u64> {
 /// How far [`callee_never_returns`] scans before giving up. A throw wrapper is a handful of instructions: set up one argument, call, trap.
 const NORETURN_SCAN_INSTRS: usize = 32;
 
+/// TVM's private stack-probe helper. It preserves RAX, RCX, and RFLAGS,
+/// touches stack pages with reads, and consumes one stack argument (`ret 8`).
+/// Match the entire body rather than a sample-specific address: any changed
+/// instruction must fall back to ordinary lifting. Its ordered page reads are
+/// retained as a StackProbe effect; it is not an ordinary ABI-clobbering call.
+const TVM_STACK_PROBE: [u8; 47] = [
+    0x9c, 0x51, 0x50, 0x48, 0x8d, 0x4c, 0x24, 0x28, 0x66, 0x81, 0xe1, 0x00, 0xf0, 0x48, 0x8d, 0x44,
+    0x24, 0x28, 0x48, 0x2b, 0x44, 0x24, 0x20, 0x48, 0x8d, 0x89, 0x00, 0xf0, 0xff, 0xff, 0x84, 0x01,
+    0x48, 0x39, 0xc1, 0x0f, 0x8d, 0xee, 0xff, 0xff, 0xff, 0x58, 0x59, 0x9d, 0xc2, 0x08, 0x00,
+];
+
+fn is_tvm_stack_probe(pe: &PeFile, target: u64) -> bool {
+    pe.read_va(target, TVM_STACK_PROBE.len())
+        .is_some_and(|bytes| bytes == TVM_STACK_PROBE.as_slice())
+}
+
 pub const ARG_REGS: [Reg; 4] = [Reg::Rcx, Reg::Rdx, Reg::R8, Reg::R9];
 /// Minimum number of registers that must still hold their entry values for a
 /// candidate guest register image to be accepted.
@@ -116,6 +132,190 @@ const MIN_SPILL_REGS: usize = 6;
 
 /// Size of the guest register image: a packed-flags word plus 16 registers.
 const GUEST_IMAGE_BYTES: u64 = 17 * 8;
+
+/// One fully audited mutation-only vtable thunk. The four immediate ranges in
+/// `proves_native_vtable_tail` are relocation-dependent; all other bytes and
+/// the executed instruction sequence are fixed. This deliberately is not a
+/// heuristic for arbitrary symbolic JMPs in the VM section.
+const NATIVE_VTABLE_THUNK: [u8; 92] = [
+    0x48, 0x85, 0xc9, 0x0f, 0x84, 0x06, 0x00, 0x00, 0x00, 0xe9, 0x09, 0x00, 0x00, 0x00, 0xe8, 0xc3,
+    0x41, 0x59, 0xf7, 0xd2, 0xff, 0x20, 0xe8, 0x49, 0x90, 0x4c, 0x8b, 0x01, 0x41, 0x50, 0x49, 0xb8,
+    0, 0, 0, 0, 0, 0, 0, 0, 0x9c, 0x49, 0x81, 0xc0, 0, 0, 0, 0, 0x9d, 0x41, 0xff, 0xe0, 0xe8, 0x41,
+    0x58, 0x49, 0xf7, 0xd0, 0x49, 0x90, 0x48, 0xf7, 0xd0, 0xba, 0xfe, 0xff, 0xff, 0xff, 0x41, 0x51,
+    0x49, 0xb9, 0, 0, 0, 0, 0, 0, 0, 0, 0x9c, 0x49, 0x81, 0xc1, 0, 0, 0, 0, 0x9d, 0x41, 0xff, 0xe1,
+];
+
+const NATIVE_VTABLE_TRACE: [u64; 25] = [
+    0, 3, 9, 23, 25, 28, 30, 40, 41, 48, 49, 53, 55, 58, 60, 63, 68, 70, 80, 81, 88, 89, 16, 18, 20,
+];
+
+/// Audited native wrapper cores after removing only fully verified relay idioms.
+/// Zero CALL displacements are wildcards whose real targets remain Call events.
+/// All other core instruction bytes, including argument save/restore widths and
+/// the vtable slot, are exact. No sample VA participates in recognition.
+struct NativeCallTail {
+    core: &'static [u8],
+    target: Reg,
+    slot: u64,
+}
+
+const NATIVE_CALL_TAILS: &[NativeCallTail] = &[
+    NativeCallTail {
+        target: Reg::Rdx,
+        slot: 0x20,
+        core: &[
+            0x48, 0x83, 0xec, 0x28, 0xe8, 0, 0, 0, 0, 0x48, 0x87, 0xca, 0x48, 0x8b, 0x10, 0x48,
+            0xf7, 0xd2, 0x48, 0x87, 0xd1, 0x48, 0xf7, 0xd1, 0x49, 0x87, 0xd0, 0x4c, 0x8b, 0x41,
+            0x20, 0x49, 0xf7, 0xd0, 0x4c, 0x87, 0xc2, 0x48, 0xf7, 0xd2, 0x48, 0xf7, 0xd0, 0x48,
+            0x91, 0x48, 0xf7, 0xd1, 0x48, 0x89, 0xc8, 0x48, 0x83, 0xc4, 0x28, 0xff, 0xe2,
+        ],
+    },
+    NativeCallTail {
+        target: Reg::Rdx,
+        slot: 0x28,
+        core: &[
+            0x48, 0x83, 0xec, 0x28, 0xe8, 0, 0, 0, 0, 0x48, 0x87, 0xca, 0x48, 0x8b, 0x10, 0x48,
+            0xf7, 0xd2, 0x48, 0x87, 0xd1, 0x48, 0xf7, 0xd1, 0x49, 0x87, 0xd0, 0x4c, 0x8b, 0x41,
+            0x28, 0x49, 0xf7, 0xd0, 0x4c, 0x87, 0xc2, 0x48, 0xf7, 0xd2, 0x48, 0xf7, 0xd0, 0x48,
+            0x91, 0x48, 0xf7, 0xd1, 0x48, 0x89, 0xc8, 0x48, 0x83, 0xc4, 0x28, 0xff, 0xe2,
+        ],
+    },
+    NativeCallTail {
+        target: Reg::Rdx,
+        slot: 8,
+        core: &[
+            0x48, 0x83, 0xec, 0x28, 0xe8, 0, 0, 0, 0, 0x49, 0x87, 0xca, 0x4c, 0x8b, 0x10, 0x49,
+            0xf7, 0xd2, 0x4c, 0x87, 0xd1, 0x48, 0xf7, 0xd1, 0x49, 0x87, 0xd3, 0x4c, 0x8b, 0x59,
+            0x08, 0x49, 0xf7, 0xd3, 0x4c, 0x87, 0xda, 0x48, 0xf7, 0xd2, 0x48, 0xf7, 0xd0, 0x48,
+            0x91, 0x48, 0xf7, 0xd1, 0x48, 0x89, 0xc8, 0x48, 0x83, 0xc4, 0x28, 0xff, 0xe2,
+        ],
+    },
+    NativeCallTail {
+        target: Reg::Rdx,
+        slot: 0x18,
+        core: &[
+            0x48, 0x83, 0xec, 0x28, 0xe8, 0, 0, 0, 0, 0x49, 0x87, 0xc8, 0x4c, 0x8b, 0x00, 0x49,
+            0xf7, 0xd0, 0x4c, 0x87, 0xc1, 0x48, 0xf7, 0xd1, 0x49, 0x87, 0xd1, 0x4c, 0x8b, 0x49,
+            0x18, 0x49, 0xf7, 0xd1, 0x4c, 0x87, 0xca, 0x48, 0xf7, 0xd2, 0x48, 0xf7, 0xd0, 0x48,
+            0x91, 0x48, 0xf7, 0xd1, 0x48, 0x89, 0xc8, 0x48, 0x83, 0xc4, 0x28, 0xff, 0xe2,
+        ],
+    },
+    NativeCallTail {
+        target: Reg::R10,
+        slot: 0,
+        core: &[
+            0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xec,
+            0x20, 0x49, 0xf7, 0xd1, 0x49, 0x87, 0xd9, 0x48, 0xf7, 0xd3, 0x49, 0x89, 0xd9, 0x44,
+            0x89, 0xc7, 0x89, 0xd6, 0xe8, 0, 0, 0, 0, 0x48, 0xf7, 0xd3, 0x4c, 0x87, 0xcb, 0x49,
+            0xf7, 0xd1, 0x4c, 0x89, 0xcb, 0x41, 0x89, 0xf8, 0x89, 0xf2, 0x49, 0x87, 0xc8, 0x4c,
+            0x8b, 0x00, 0x49, 0xf7, 0xd0, 0x4c, 0x87, 0xc1, 0x48, 0xf7, 0xd1, 0x4d, 0x87, 0xd1,
+            0x4c, 0x8b, 0x09, 0x49, 0xf7, 0xd1, 0x4d, 0x87, 0xca, 0x49, 0xf7, 0xd2, 0x48, 0xf7,
+            0xd0, 0x48, 0x91, 0x48, 0xf7, 0xd1, 0x48, 0x89, 0xc8, 0x48, 0x8b, 0x5c, 0x24, 0x30,
+            0x48, 0x8b, 0x74, 0x24, 0x38, 0x48, 0x83, 0xc4, 0x20, 0x48, 0x8b, 0x3c, 0x24, 0x48,
+            0x8d, 0x64, 0x24, 0x08, 0x41, 0xff, 0xe2,
+        ],
+    },
+    NativeCallTail {
+        target: Reg::R9,
+        slot: 0x10,
+        core: &[
+            0x48, 0x89, 0x5c, 0x24, 0x08, 0x57, 0x48, 0x83, 0xec, 0x20, 0x44, 0x89, 0xc3, 0x48,
+            0xf7, 0xd2, 0x48, 0x87, 0xfa, 0x48, 0xf7, 0xd7, 0x48, 0x89, 0xfa, 0xe8, 0, 0, 0, 0,
+            0x41, 0x89, 0xd8, 0x48, 0xf7, 0xd7, 0x48, 0x87, 0xd7, 0x48, 0xf7, 0xd2, 0x48, 0x89,
+            0xd7, 0x48, 0x87, 0xca, 0x48, 0x8b, 0x10, 0x48, 0xf7, 0xd2, 0x48, 0x87, 0xd1, 0x48,
+            0xf7, 0xd1, 0x4c, 0x87, 0xca, 0x48, 0x8b, 0x51, 0x10, 0x48, 0xf7, 0xd2, 0x49, 0x87,
+            0xd1, 0x49, 0xf7, 0xd1, 0x48, 0xf7, 0xd0, 0x48, 0x91, 0x48, 0xf7, 0xd1, 0x48, 0x89,
+            0xc8, 0x48, 0x8b, 0x5c, 0x24, 0x30, 0x48, 0x83, 0xc4, 0x20, 0x48, 0x8b, 0x3c, 0x24,
+            0x48, 0x8d, 0x64, 0x24, 0x08, 0x41, 0xff, 0xe1,
+        ],
+    },
+];
+
+/// Return the length of a complete register/flags-preserving relay. Every
+/// sequential edge and the computed JMP-to-POP edge is checked against bytes;
+/// merely observing a concrete destination is not enough to erase a relay.
+fn native_tail_relay(trace: &[Instruction]) -> Option<usize> {
+    let push = trace.first()?;
+    let reg = push.op0_register();
+    if push.mnemonic() != Mnemonic::Push
+        || push.op0_kind() != OpKind::Register
+        || !matches!(decode_reg(reg), Some((r, 0, Width::W64)) if r != Reg::Rsp)
+    {
+        return None;
+    }
+    let unary = |i: &Instruction, mnemonic| {
+        i.mnemonic() == mnemonic && i.op0_kind() == OpKind::Register && i.op0_register() == reg
+    };
+    let lea = |i: &Instruction, base| {
+        unary(i, Mnemonic::Lea)
+            && i.op1_kind() == OpKind::Memory
+            && i.memory_base() == base
+            && i.memory_index() == Register::None
+    };
+    let (len, target) = if trace.len() >= 5
+        && lea(&trace[1], Register::RIP)
+        && lea(&trace[2], reg)
+        && unary(&trace[3], Mnemonic::Jmp)
+    {
+        (
+            5,
+            trace[1]
+                .ip_rel_memory_address()
+                .wrapping_add(trace[2].memory_displacement64()),
+        )
+    } else if trace.len() >= 7
+        && unary(&trace[1], Mnemonic::Mov)
+        && trace[1].op1_kind() == OpKind::Immediate64
+        && trace[2].mnemonic() == Mnemonic::Pushfq
+        && unary(&trace[3], Mnemonic::Add)
+        && trace[3].op1_kind() == OpKind::Immediate32to64
+        && trace[4].mnemonic() == Mnemonic::Popfq
+        && unary(&trace[5], Mnemonic::Jmp)
+    {
+        (
+            7,
+            trace[1]
+                .immediate64()
+                .wrapping_add(trace[3].immediate32to64() as u64),
+        )
+    } else {
+        return None;
+    };
+    if !unary(&trace[len - 1], Mnemonic::Pop)
+        || target != trace[len - 1].ip()
+        || trace[..len - 1]
+            .windows(2)
+            .any(|pair| pair[0].next_ip() != pair[1].ip())
+    {
+        return None;
+    }
+    Some(len)
+}
+
+fn native_tail_arg32(arena: &Arena, value: Ref, reg: Reg) -> bool {
+    // The expression arena canonicalizes zero-extended low-dword writes to a
+    // 64-bit AND when the source already has an initial-register identity.
+    if let Op::Bin(BinOp::And, a, b) = *arena.op(value) {
+        let original = if arena.as_const(a) == Some(0xffff_ffff) {
+            b
+        } else if arena.as_const(b) == Some(0xffff_ffff) {
+            a
+        } else {
+            return false;
+        };
+        return arena.width(value) == Width::W64
+            && matches!(arena.op(original), Op::InitReg(r) if *r == reg);
+    }
+    let Op::Zext(narrow) = arena.op(value) else {
+        return false;
+    };
+    let Op::Trunc(original) = arena.op(*narrow) else {
+        return false;
+    };
+    arena.width(value) == Width::W64
+        && arena.width(*narrow) == Width::W32
+        && matches!(arena.op(*original), Op::InitReg(r) if *r == reg)
+}
 
 /// Which part of the machine a memory access touches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +341,10 @@ impl Region {
 /// Guest-visible effect observed during evaluation.
 #[derive(Debug, Clone)]
 pub enum Event {
+    /// Ordered page reads made by the exact TVM stack-probe helper. Starting
+    /// with cursor = top & !0xfff and limit = top - size, read a byte at
+    /// cursor -= 4096 at least once, then repeat while cursor >= limit signed.
+    StackProbe { top: Ref, size: Ref, site: u64 },
     /// A store whose address is *not* inside the VM's own scratch area.
     Store {
         addr: Ref,
@@ -188,6 +392,9 @@ impl Event {
     /// Append every expression reference retained by this event.
     pub(crate) fn append_roots(&self, roots: &mut Vec<Ref>) {
         match self {
+            Self::StackProbe { top, size, .. } => {
+                roots.extend([*top, *size]);
+            }
             Self::Store { addr, value, .. } | Self::Load { addr, value, .. } => {
                 roots.push(*addr);
                 roots.push(*value);
@@ -218,6 +425,10 @@ impl Event {
                 .expect("event root missing from arena compaction map")
         };
         match self {
+            Self::StackProbe { top, size, .. } => {
+                *top = mapped(*top);
+                *size = mapped(*size);
+            }
             Self::Store { addr, value, .. } | Self::Load { addr, value, .. } => {
                 *addr = mapped(*addr);
                 *value = mapped(*value);
@@ -294,6 +505,16 @@ pub enum Stop {
     Diverged { site: u64, nodes: usize },
     /// Reached an address outside the image.
     OutOfImage { site: u64 },
+    /// A computed jump that folded to a concrete address that is not executable
+    /// code.
+    ///
+    /// This is the same situation [`Stop::OutOfImage`] reports, except that it is
+    /// raised *at the jump* while the destination expression still exists.
+    /// `run` can only look at the next instruction pointer, and by then the
+    /// expression that produced it is gone, so diagnostics are left with a bare
+    /// number. Carrying the expression here preserves why the jump failed without
+    /// claiming that another forced pin makes the observed outcome unreachable.
+    BadTarget { site: u64, dest: Ref, target: u64 },
     /// A call to a routine that never returns. The block ends at the call.
     NoReturn { site: u64 },
 }
@@ -368,6 +589,10 @@ pub struct Emulator<'a> {
     /// stack has no guest semantics: the VM only uses it to keep its own
     /// non-returning CALLs from overflowing the shadow stack.
     pub assume_cet_disabled: bool,
+    /// Test-only switch to compare inline helper execution with the production
+    /// effect-preserving summary. Production always uses exact-body recognition.
+    #[cfg(test)]
+    experimental_stack_probe_summary: bool,
     /// `[lo, hi)` VA range of the VM section. Calls landing inside it are VM
     /// control flow to be inlined; calls leaving it are guest semantics.
     pub vm_range: (u64, u64),
@@ -389,6 +614,17 @@ pub struct Emulator<'a> {
 const MAX_SAFE_LIVE_DAG_DEPTH: usize = 2_048;
 
 impl<'a> Emulator<'a> {
+    fn stack_probe_summary_enabled(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.experimental_stack_probe_summary
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
+    }
+
     pub fn new(pe: &'a PeFile, stack_base: u64) -> Self {
         Self::with_vm_section(pe, stack_base, ".tvm0")
     }
@@ -419,6 +655,8 @@ impl<'a> Emulator<'a> {
             ctx_miss: None,
             guest_ctx: None,
             stop_on_revisit: true,
+            #[cfg(test)]
+            experimental_stack_probe_summary: true,
             block_entries: std::collections::HashSet::new(),
             events_at_block_entry: 0,
             unwind_slot: None,
@@ -467,11 +705,480 @@ impl<'a> Emulator<'a> {
         if !matches!(self.arena.op(*expr), Op::Param(..)) {
             return None;
         }
-        self.pins.iter().find(|(r, _)| r == expr).map(|(_, c)| *c)
+        first_pin(&self.pins, *expr)
+    }
+
+    /// Fold `r` with `cand` forced to `value`, taking precedence over any pin the state
+    /// already carries for it.
+    ///
+    /// `pins` is a list searched front to back and substitution takes the first match, so
+    /// appending a second entry for a candidate that is already pinned leaves the older
+    /// value in force. Asking what a *different* value would produce therefore needs the
+    /// old entry removed, not merely shadowed by a later one. Everything derived that the
+    /// substitution touches is restored before returning, so this is a query and not a
+    /// state change.
+    ///
+    /// Returns the folded destination, and the block identity the state would resume at.
+    pub fn probe_pin(&mut self, cand: Ref, value: u64, r: Ref) -> (Option<u64>, Option<u64>) {
+        let saved_pins = self.pins.clone();
+        let saved_watermark = self.memo_pin_count;
+        self.pins.retain(|(p, _)| *p != cand);
+        self.pins.push((cand, value));
+        let target = self.fold_now(r);
+        let vip = self.current_vip();
+        self.pins = saved_pins;
+        self.subst_memo.clear();
+        self.pin_dep.clear();
+        self.memo_pin_count = saved_watermark;
+        (target, vip)
+    }
+
+    /// Fold `r` with `cand = value` appended to the pin list, which is what a split attempt
+    /// does. Kept beside [`Self::probe_pin`] so the two can be compared: when they disagree,
+    /// an older pin for the same candidate was silently the one in force.
+    pub fn probe_pin_appended(&mut self, cand: Ref, value: u64, r: Ref) -> Option<u64> {
+        let saved_watermark = self.memo_pin_count;
+        self.pins.push((cand, value));
+        let target = self.fold_now(r);
+        self.pins.pop();
+        self.subst_memo.clear();
+        self.pin_dep.clear();
+        self.memo_pin_count = saved_watermark;
+        target
+    }
+
+    /// Substitute `r` under the current pin set and return the constant it folded to.
+    fn fold_now(&mut self, r: Ref) -> Option<u64> {
+        self.subst_memo.clear();
+        self.pin_dep.clear();
+        self.memo_pin_count = self.pins.len();
+        let folded = self.substitute(r);
+        self.arena.as_const(folded)
     }
 
     pub fn current_vip(&self) -> Option<u64> {
         self.vip_at_depth(Self::VIP_DEPTH)
+    }
+
+    /// Prove the single audited native vtable-tail shape, including its complete
+    /// path and Win64 argument/return-stack state. Absence of a VM context or
+    /// an argument-dependent pointer by itself is never sufficient.
+    pub(crate) fn proves_native_vtable_tail(&self, site: u64, dest: Ref) -> bool {
+        if self.guest_ctx.is_some()
+            || self.guest_layout.is_some()
+            || self.vip_slot.is_some()
+            || self.current_vip().is_some()
+            || self.steps != NATIVE_VTABLE_TRACE.len()
+            || self.trace.len() != NATIVE_VTABLE_TRACE.len()
+            || self.state.concrete_rsp(&self.arena) != Some(self.stack_base)
+            || !self.state.sym_stores.is_empty()
+            || self
+                .state
+                .mem
+                .keys()
+                .any(|&addr| addr.wrapping_sub(self.stack_base) < Width::W64.bits() as u64 / 8)
+        {
+            return false;
+        }
+        let Some(start) = site.checked_sub(20) else {
+            return false;
+        };
+        let Some(bytes) = self.pe.read_va(start, NATIVE_VTABLE_THUNK.len()) else {
+            return false;
+        };
+        for (offset, (&actual, &expected)) in bytes.iter().zip(&NATIVE_VTABLE_THUNK).enumerate() {
+            if !matches!(offset, 32..40 | 44..48 | 72..80 | 84..88) && actual != expected {
+                return false;
+            }
+        }
+        for (immediate, displacement, target_offset) in [(32, 44, 53), (72, 84, 16)] {
+            let absolute = u64::from_le_bytes(bytes[immediate..immediate + 8].try_into().unwrap());
+            let delta =
+                i32::from_le_bytes(bytes[displacement..displacement + 4].try_into().unwrap());
+            if absolute.wrapping_add_signed(delta as i64) != start.wrapping_add(target_offset) {
+                return false;
+            }
+        }
+        if !self
+            .trace
+            .iter()
+            .zip(NATIVE_VTABLE_TRACE)
+            .all(|(&address, offset)| address == start.wrapping_add(offset))
+        {
+            return false;
+        }
+        let Op::Load(table, _) = *self.arena.op(dest) else {
+            return false;
+        };
+        let Op::Load(object, _) = *self.arena.op(table) else {
+            return false;
+        };
+        if self.arena.width(dest) != Width::W64
+            || self.arena.width(table) != Width::W64
+            || !matches!(self.arena.op(object), Op::InitReg(Reg::Rcx))
+            || self.state.reg(Reg::Rax) != table
+            || self.arena.as_const(self.state.reg(Reg::Rdx)) != Some(1)
+        {
+            return false;
+        }
+        crate::ir::expr::GPRS.iter().all(|&reg| {
+            matches!(reg, Reg::Rax | Reg::Rdx | Reg::Rsp)
+                || matches!(self.arena.op(self.state.reg(reg)), Op::InitReg(original) if *original == reg)
+        })
+    }
+
+    /// Prove a native indirect tail reached after a complete VM exit restore.
+    ///
+    /// These paths are longer than the standalone mutation thunks above: the
+    /// interpreter spills and reloads a guest image, then restores flags and the
+    /// guest stack before the final computed jump.  The proof deliberately keys
+    /// off the complete six-instruction restore epilogue and the already
+    /// recovered VM state; no address or "outside the image" heuristic is used.
+    pub(crate) fn proves_native_vm_tail(&self, site: u64, dest: Ref) -> bool {
+        if self.guest_ctx.is_none()
+            || self.guest_layout.is_none()
+            || self.current_vip().is_some()
+            || !self.pins.is_empty()
+            || self.steps != self.trace.len()
+            || self.trace.back() != Some(&site)
+            || self.steps < 6
+            || self.state.concrete_rsp(&self.arena) != Some(self.stack_base)
+            || !self.state.sym_stores.is_empty()
+            || self.dispatches.is_empty()
+            || self.dispatches.iter().any(|(_, target)| !self.in_vm(*target))
+            || self.events.iter().any(|event| matches!(event, Event::Boxed { .. }))
+        {
+            return false;
+        }
+
+        // The six instructions immediately before the symbolic jump are the
+        // VM's fixed exit epilogue.  The context base register and the final
+        // pointer restore are relocation-independent; only the context-register
+        // slot is allowed to be 0x48 or 0x50, as observed in the audited layouts.
+        let Some(trace) = self
+            .trace
+            .iter()
+            .map(|&ip| disasm::decode_at(self.pe, ip))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return false;
+        };
+        let tail = &trace[trace.len() - 6..];
+        let context_reg = tail[0].memory_base();
+        if tail[0].mnemonic() != Mnemonic::Push
+            || tail[0].op_kind(0) != OpKind::Memory
+            || context_reg == Register::None
+            || tail[0].memory_index() != Register::None
+            || tail[0].memory_displacement64() != 0x80
+            || tail[1].mnemonic() != Mnemonic::Popfq
+            || tail[2].mnemonic() != Mnemonic::Push
+            || tail[2].op_kind(0) != OpKind::Memory
+            || tail[2].memory_base() != context_reg
+            || tail[2].memory_index() != Register::None
+            || tail[2].memory_displacement64() != 0x20
+            || tail[3].mnemonic() != Mnemonic::Mov
+            || tail[3].op_kind(0) != OpKind::Register
+            || tail[3].op0_register() != context_reg
+            || tail[3].op_kind(1) != OpKind::Memory
+            || tail[3].memory_base() != context_reg
+            || tail[3].memory_index() != Register::None
+            || !matches!(tail[3].memory_displacement64(), 0x48 | 0x50)
+            || tail[4].mnemonic() != Mnemonic::Mov
+            || tail[4].op_kind(0) != OpKind::Register
+            || tail[4].op0_register() != Register::RSP
+            || tail[4].op_kind(1) != OpKind::Memory
+            || tail[4].memory_base() != Register::RSP
+            || tail[4].memory_index() != Register::None
+            || tail[4].memory_displacement64() != 0
+            || tail[5].mnemonic() != Mnemonic::Jmp
+            || tail[5].ip() != site
+        {
+            return false;
+        }
+
+        let Some((_context, _, Width::W64)) = decode_reg(context_reg) else {
+            return false;
+        };
+        let target_is_register = if tail[5].op_kind(0) == OpKind::Register {
+            let Some((target, _, Width::W64)) = decode_reg(tail[5].op0_register()) else {
+                return false;
+            };
+            if self.state.reg(target) != dest {
+                return false;
+            }
+            Some(target)
+        } else if tail[5].op_kind(0) == OpKind::Memory
+            && tail[5].memory_index() == Register::None
+        {
+            let Some((base, _, Width::W64)) = decode_reg(tail[5].memory_base()) else {
+                return false;
+            };
+            let Op::Load(address, _width) = *self.arena.op(dest) else {
+                return false;
+            };
+            if self.arena.width(dest) != Width::W64 || self.arena.width(address) != Width::W64 {
+                return false;
+            }
+            let base_value = self.state.reg(base);
+            let displacement = tail[5].memory_displacement64();
+            let address_matches = match *self.arena.op(address) {
+                Op::Bin(BinOp::Add, a, b) => {
+                    (a == base_value && self.arena.as_const(b) == Some(displacement))
+                        || (b == base_value && self.arena.as_const(a) == Some(displacement))
+                }
+                _ => displacement == 0 && address == base_value,
+            };
+            if !address_matches {
+                return false;
+            }
+            None
+        } else {
+            return false;
+        };
+
+        // The VM must have restored all nonvolatile guest registers.  Volatile
+        // registers may hold the user-visible return value or the indirect-tail
+        // target, but opaque/parameter values here would expose interpreter state.
+        for reg in [
+            Reg::Rbx,
+            Reg::Rbp,
+            Reg::Rsi,
+            Reg::Rdi,
+            Reg::R12,
+            Reg::R13,
+            Reg::R14,
+            Reg::R15,
+        ] {
+            if !matches!(self.arena.op(self.state.reg(reg)), Op::InitReg(original) if *original == reg) {
+                return false;
+            }
+        }
+        let allowed_non_initial = [Reg::Rax, Reg::Rcx, Reg::Rdx, Reg::R8, Reg::R9, Reg::R10, Reg::R11];
+        if crate::ir::expr::GPRS.iter().any(|&reg| {
+            if reg == Reg::Rsp || target_is_register == Some(reg) {
+                return false;
+            }
+            if allowed_non_initial.contains(&reg) {
+                return false;
+            }
+            !matches!(self.arena.op(self.state.reg(reg)), Op::InitReg(original) if *original == reg)
+        }) {
+            return false;
+        }
+
+        // At most one ordinary helper call is allowed.  It must be a real
+        // executable, non-VM target with a concrete Win64 stack; imports and
+        // boxed side effects remain outside this proof.
+        let mut call_count = 0usize;
+        for event in &self.events {
+            let Event::Call {
+                target,
+                rsp,
+                import_slot,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            call_count += 1;
+            let (Some(target), Some(rsp)) = (target, rsp) else {
+                return false;
+            };
+            if import_slot.is_some()
+                || call_count > 1
+                || self
+                    .arena
+                    .as_const(*target)
+                    .is_none_or(|t| !self.pe.is_executable(t) || self.in_vm(t))
+                || *rsp < self.stack_base.saturating_sub(0x1000)
+                || *rsp > self.stack_base
+            {
+                return false;
+            }
+        }
+
+        // A final tail must actually depend on guest state or a proved helper
+        // return.  This rejects a fixed VM dispatcher target that merely happens
+        // to match the epilogue shape.
+        let leaves = crate::ir::expr::leaves(&self.arena, dest);
+        leaves.iter().any(|leaf| {
+            matches!(self.arena.op(*leaf), Op::InitReg(_) | Op::Opaque("call_ret", _))
+        })
+            && _context != Reg::Rsp
+    }
+
+    /// Prove an audited single-call native wrapper after removing complete
+    /// side-effect-neutral relay idioms. The helper remains a real Call event;
+    /// its return, all argument restores, and the once-loaded target are kept.
+    pub(crate) fn proves_native_call_tail(&self, site: u64, dest: Ref) -> bool {
+        if self.guest_ctx.is_some()
+            || self.guest_layout.is_some()
+            || self.vip_slot.is_some()
+            || self.current_vip().is_some()
+            || !self.pins.is_empty()
+            || self.steps != self.trace.len()
+            || !(18..=128).contains(&self.steps)
+            || self.trace.back() != Some(&site)
+            || self.state.concrete_rsp(&self.arena) != Some(self.stack_base)
+            || !self.state.sym_stores.is_empty()
+            || self.state.mem.keys().any(|&addr| {
+                let offset = addr.wrapping_sub(self.stack_base) as i64;
+                !(-0x40..0).contains(&offset) && !(8..0x20).contains(&offset)
+            })
+        {
+            return false;
+        }
+        let Some(trace) = self
+            .trace
+            .iter()
+            .map(|&ip| disasm::decode_at(self.pe, ip))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return false;
+        };
+        let mut core = Vec::new();
+        let mut i = 0;
+        let mut relay_count = 0;
+        let mut call_site = None;
+        let mut call_target = None;
+        while i < trace.len() {
+            if let Some(len) = native_tail_relay(&trace[i..]) {
+                if i + len >= trace.len() || trace[i + len - 1].next_ip() != trace[i + len].ip() {
+                    return false;
+                }
+                relay_count += 1;
+                i += len;
+                continue;
+            }
+            let inst = &trace[i];
+            let Some(bytes) = self.pe.read_va(inst.ip(), inst.len()) else {
+                return false;
+            };
+            if inst.mnemonic() == Mnemonic::Call {
+                let Some(target) = disasm::direct_target(inst) else {
+                    return false;
+                };
+                if bytes.len() != 5
+                    || bytes[0] != 0xe8
+                    || call_site.replace(inst.ip()).is_some()
+                    || !self.pe.is_executable(target)
+                    || self.in_vm(target)
+                {
+                    return false;
+                }
+                call_target = Some(target);
+                core.extend_from_slice(&[0xe8, 0, 0, 0, 0]);
+            } else {
+                core.extend_from_slice(bytes);
+            }
+            if i + 1 < trace.len() && inst.next_ip() != trace[i + 1].ip() {
+                return false;
+            }
+            i += 1;
+        }
+        let Some(shape) = NATIVE_CALL_TAILS.iter().find(|shape| shape.core == core) else {
+            return false;
+        };
+        if self.dispatches.len() != relay_count || self.state.reg(shape.target) != dest {
+            return false;
+        }
+        let mut calls = self.events.iter().filter_map(|event| match event {
+            Event::Call { .. } => Some(event),
+            _ => None,
+        });
+        let Some(Event::Call {
+            target: Some(target),
+            site: event_site,
+            rsp: Some(rsp),
+            import_slot: None,
+            args,
+            ret: Some(ret),
+        }) = calls.next()
+        else {
+            return false;
+        };
+        if calls.next().is_some()
+            || Some(*event_site) != call_site
+            || self.arena.as_const(*target) != call_target
+            || *rsp != self.stack_base.wrapping_sub(0x28)
+            || args
+                .iter()
+                .any(|(reg, value)| !matches!(self.arena.op(*value), Op::InitReg(r) if r == reg))
+            || !matches!(self.arena.op(*ret), Op::Opaque("call_ret", _))
+            || self.state.reg(Reg::Rax) != *ret
+            || self.state.reg(Reg::Rcx) != *ret
+        {
+            return false;
+        }
+        let Op::Load(address, _) = *self.arena.op(dest) else {
+            return false;
+        };
+        let table = if shape.slot == 0 {
+            address
+        } else {
+            match *self.arena.op(address) {
+                Op::Bin(BinOp::Add, a, b) if self.arena.as_const(a) == Some(shape.slot) => b,
+                Op::Bin(BinOp::Add, a, b) if self.arena.as_const(b) == Some(shape.slot) => a,
+                _ => return false,
+            }
+        };
+        if self.arena.width(dest) != Width::W64
+            || self.arena.width(table) != Width::W64
+            || !matches!(self.arena.op(table), Op::Load(value, _) if value == ret)
+        {
+            return false;
+        }
+        let loads: Vec<_> = self
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Load { value, .. } => Some(*value),
+                _ => None,
+            })
+            .collect();
+        if loads != [table, dest] || self.events.iter().any(|e| matches!(e, Event::Boxed { .. })) {
+            return false;
+        }
+        // Full core-byte matching also fixes which incoming registers feed the
+        // helper. These checks explicitly protect the outgoing ABI state.
+        let initial =
+            |reg| matches!(self.arena.op(self.state.reg(reg)), Op::InitReg(r) if *r == reg);
+        let clobbered = |reg| {
+            matches!(
+                self.arena.op(self.state.reg(reg)),
+                Op::Opaque("clobbered", _)
+            )
+        };
+        if [
+            Reg::Rbx,
+            Reg::Rbp,
+            Reg::Rsi,
+            Reg::Rdi,
+            Reg::R12,
+            Reg::R13,
+            Reg::R14,
+            Reg::R15,
+        ]
+        .into_iter()
+        .any(|reg| !initial(reg))
+            || !clobbered(Reg::R11)
+        {
+            return false;
+        }
+        match shape.target {
+            Reg::Rdx => [Reg::R8, Reg::R9, Reg::R10].into_iter().all(clobbered),
+            Reg::R10 => {
+                native_tail_arg32(&self.arena, self.state.reg(Reg::Rdx), Reg::Rdx)
+                    && native_tail_arg32(&self.arena, self.state.reg(Reg::R8), Reg::R8)
+                    && initial(Reg::R9)
+            }
+            Reg::R9 => {
+                initial(Reg::Rdx)
+                    && native_tail_arg32(&self.arena, self.state.reg(Reg::R8), Reg::R8)
+                    && clobbered(Reg::R10)
+            }
+            _ => false,
+        }
     }
 
     /// Bound on the VIP expression hash.
@@ -763,7 +1470,7 @@ impl<'a> Emulator<'a> {
             .iter()
             .filter(|e| match e {
                 Event::Store { region, .. } | Event::Load { region, .. } => region.is_guest(),
-                Event::Boxed { .. } | Event::Call { .. } => true,
+                Event::Boxed { .. } | Event::Call { .. } | Event::StackProbe { .. } => true,
             })
             .count()
     }
@@ -975,6 +1682,13 @@ impl<'a> Emulator<'a> {
             });
             return v;
         }
+        // An exact symbolic base and byte offset can still identify a value we
+        // just stored. The cache is invalidated by potentially aliasing writes,
+        // external calls and CFG joins; this is a current read, never a rewrite
+        // of an old Load with a different memory generation.
+        if let Some(v) = self.state.load_symbolic(&mut self.arena, addr, width) {
+            return v;
+        }
         // The address is not concrete, but it may still take only two values: the
         // VM reads its dispatch tables with `mov eax, [C + (cond << k)]`. Resolve
         // that here rather than leaving an opaque read behind.
@@ -1042,7 +1756,8 @@ impl<'a> Emulator<'a> {
                 // Not a discriminator for this address after all.
                 continue;
             }
-            let (Some(v0), Some(v1)) = (self.image_load(a0, width), self.image_load(a1, width)) else {
+            let (Some(v0), Some(v1)) = (self.image_load(a0, width), self.image_load(a1, width))
+            else {
                 continue;
             };
             let v = self.arena.select(cand, v1, v0);
@@ -1085,12 +1800,13 @@ impl<'a> Emulator<'a> {
             self.arena.bump_mem_gen();
             self.arena.note_concrete_store(a, bytes);
         } else {
-            // A symbolic address cannot be resolved against the byte map, so the
-            // pending symbolic store is what a later load consults. Push an opaque
-            // of the widest width that fits, which keeps the load from folding
-            // against anything older at the same expression.
+            // Keep the unknown write in the diagnostic history, and invalidate
+            // forwarding rather than claiming a scalar opaque covers all bytes.
             let w = Width::from_bytes(bytes).unwrap_or(Width::W64);
             let v = self.arena.opaque("boxed_mem", w);
+            // The boxed write can be wider than any scalar IR width, so its
+            // opaque must not seed a falsely complete forwarding interval.
+            self.state.forget_symbolic_memory();
             self.state.sym_stores.push((addr, v, w));
             self.arena.bump_mem_gen();
             self.arena.note_symbolic_store();
@@ -1127,7 +1843,7 @@ impl<'a> Emulator<'a> {
             });
             return;
         }
-        self.state.sym_stores.push((addr, value, width));
+        self.state.store_symbolic(&self.arena, addr, value, width);
         self.arena.bump_mem_gen();
         self.arena.note_symbolic_store();
         let region = self.region_of_symbolic(addr);
@@ -1826,11 +2542,26 @@ impl<'a> Emulator<'a> {
                         }
                     }
                 }
-                let dest = self.read_op(&inst, 0);
-                let dest = self.substitute(dest);
+                // Kept alongside the substituted form: `substitute` is what folds
+                // the dispatch address down, so if the fold lands somewhere that
+                // is not code, this is the only copy that still shows why.
+                let raw_dest = self.read_op(&inst, 0);
+                let dest = self.substitute(raw_dest);
                 match self.arena.as_const(dest) {
                     Some(t) => {
-                        // A resolved indirect jump is a VM handler transition.
+                        // A resolved indirect jump is a VM handler transition only
+                        // when it actually lands on code. A destination
+                        // that folds to something outside the image (the VM's own
+                        // image base is the value this usually produces) would end
+                        // the block one iteration later as `OutOfImage`, with no
+                        // expression left to split on.
+                        if !self.pe.is_executable(t) {
+                            return Step::Stopped(Stop::BadTarget {
+                                site: ip,
+                                dest: raw_dest,
+                                target: t,
+                            });
+                        }
                         self.dispatches.push((ip, t));
                         // Reaching the identity of an already-recovered block
                         // closes a loop. Stopping keeps cost linear in the
@@ -1913,6 +2644,38 @@ impl<'a> Emulator<'a> {
                 let target = target.filter(|t| self.pe.is_executable(*t));
                 let internal = target.is_some_and(|t| self.in_vm(t));
                 if internal {
+                    if target.is_some_and(|t| is_tvm_stack_probe(self.pe, t))
+                        && self.stack_probe_summary_enabled()
+                    {
+                        // Summarize the complete CALL/helper/RET sequence. The
+                        // return address cancels out and `ret 8` consumes the
+                        // caller's argument. In particular, do not ABI-clobber
+                        // registers/flags or manufacture a semantic guest call.
+                        let sp = self.state.reg(Reg::Rsp);
+                        // Retain the helper's temporary writes in abstract
+                        // memory: a later VM read may still observe these slots.
+                        // Normal region classification decides which writes are
+                        // interpreter scratch and which are guest-visible.
+                        let saved_flags = self.state.pack_flags(&mut self.arena);
+                        let saved_rcx = self.state.reg(Reg::Rcx);
+                        let saved_rax = self.state.reg(Reg::Rax);
+                        let return_address = self.arena.constant(ret, Width::W64);
+                        self.push(return_address, Width::W64, ip);
+                        let helper = target.expect("recognized helper target");
+                        self.push(saved_flags, Width::W64, helper);
+                        self.push(saved_rcx, Width::W64, helper + 1);
+                        self.push(saved_rax, Width::W64, helper + 2);
+                        let size = self.load(sp, Width::W64, ip);
+                        let eight = self.arena.constant(8, Width::W64);
+                        let sp = self.arena.bin(BinOp::Add, sp, eight);
+                        self.events.push(Event::StackProbe {
+                            top: sp,
+                            size,
+                            site: ip,
+                        });
+                        self.state.set_reg(Reg::Rsp, sp);
+                        return Step::Next(ret);
+                    }
                     let r = self.arena.constant(ret, Width::W64);
                     self.push(r, Width::W64, ip);
                     return Step::Next(target.expect("internal implies known target"));
@@ -1954,6 +2717,17 @@ impl<'a> Emulator<'a> {
                     let k = self.arena.constant(n, Width::W64);
                     let sp = self.arena.bin(BinOp::Add, sp, k);
                     self.state.set_reg(Reg::Rsp, sp);
+                }
+                // CALLs inside the VM section are evaluated inline above.
+                // Their RETs must resume that VM continuation as well: stopping
+                // here emits a native tail jump back into an unfinished VM
+                // prologue (for example after TVM's stack-probe helper).
+                // The guest caller's symbolic return and concrete exits outside
+                // the VM still terminate the recovered function.
+                if let Some(target) = self.arena.as_const(dest) {
+                    if self.in_vm(target) && self.pe.is_executable(target) {
+                        return Step::Next(target);
+                    }
                 }
                 Step::Stopped(Stop::Return { site: ip, dest })
             }
@@ -2062,7 +2836,7 @@ impl<'a> Emulator<'a> {
         // For instructions such as `cpuid`, reading later would capture the new output.
         // writes it; reading afterwards would capture the opaque it just created
         // instead of the guest value the instruction actually consumes.
-        let uses = self.boxed_uses(inst);
+        let uses = self.boxed_uses(inst, mem.is_some());
         // Effects first: the event carries the opaques this produces, so scheduling can
         // place them at the instruction rather than at their first reader.
         let defs = self.apply_boxed_effects(inst, inst.mnemonic(), writes_mem);
@@ -2109,7 +2883,7 @@ impl<'a> Emulator<'a> {
             memo.insert(r, r);
             return r;
         }
-        if let Some(&(_, v)) = self.pins.iter().find(|(p, _)| *p == r) {
+        if let Some(v) = first_pin(&self.pins, r) {
             let w = self.arena.width(r);
             let k = self.arena.constant(v, w);
             memo.insert(r, k);
@@ -2331,7 +3105,7 @@ impl<'a> Emulator<'a> {
     }
 
     /// Make the destination and flag effects of a boxed instruction opaque.
-    fn boxed_uses(&mut self, inst: &Instruction) -> Vec<(Register, Ref)> {
+    fn boxed_uses(&mut self, inst: &Instruction, relocated_memory: bool) -> Vec<(Register, Ref)> {
         let op_code = inst.op_code();
         let mut encoded: Vec<Register> = Vec::new();
         for i in 0..inst.op_count() {
@@ -2367,8 +3141,18 @@ impl<'a> Emulator<'a> {
                 encoded.push(inst.op_register(i));
             }
         }
+        // The address DAG already carries explicit memory base/index reads. The
+        // emitter replaces that operand with [scratch], so re-homing its old
+        // address registers would evaluate the address twice and can move the
+        // physical RSP. Ask iced for the remaining reads, rather than removing
+        // registers by name: CMPXCHG [RAX],ECX still consumes implicit RAX.
+        let mut register_inputs = *inst;
+        if relocated_memory {
+            register_inputs.set_memory_base(Register::None);
+            register_inputs.set_memory_index(Register::None);
+        }
         let mut f = InstructionInfoFactory::new();
-        let info = f.info(inst);
+        let info = f.info(&register_inputs);
         let mut out: Vec<(Register, Ref)> = Vec::new();
         for u in info.used_registers() {
             let reads = matches!(
@@ -2383,7 +3167,9 @@ impl<'a> Emulator<'a> {
             if r == Register::None || r == Register::RIP {
                 continue;
             }
-            if encoded.contains(&r) {
+            // A real RSP data input must remain visible to codegen's rejection
+            // gate. It is distinct from an address-only read removed above.
+            if encoded.contains(&r) && r.full_register() != Register::RSP {
                 continue;
             }
             // Only registers the allocator manages can be re-homed. `decode_reg`
@@ -2408,6 +3194,12 @@ impl<'a> Emulator<'a> {
         reemitted_mem: bool,
     ) -> Vec<(Register, Ref)> {
         use Mnemonic as M;
+
+        // Boxed instructions can write through implicit operands (STOS/MOVS,
+        // MASKMOV) or transfer control to an external environment (VMX). Their
+        // explicit operand list is not a complete memory-effect description.
+        // Invalidate forwarding for every boxed instruction conservatively.
+        self.state.forget_symbolic_memory();
 
         // Registers this instruction leaves a value in, for `Event::Boxed::defs`.
         // Only the fixed-register hardware reads report here: the generic case below
@@ -2536,6 +3328,7 @@ impl<'a> Emulator<'a> {
     /// Clobber the volatile registers a call destroys, returning the `call_ret`
     /// opaque left in RAX so the caller can record it on the event.
     fn clobber_call(&mut self) -> Option<Ref> {
+        self.state.forget_symbolic_memory();
         let mut ret = None;
         for r in [
             Reg::Rax,
@@ -2614,7 +3407,14 @@ impl<'a> Emulator<'a> {
                 return Stop::OutOfImage { site: ip };
             }
             if self.arena.len() > self.node_limit {
-                let (_, live, max_depth) = self.compact_arena(retained);
+                let (before, live, max_depth) = self.compact_arena(retained);
+                crate::vm::diag::record_compaction(crate::vm::diag::CompactionDiag {
+                    site: ip,
+                    before,
+                    after: live,
+                    max_depth,
+                    ..Default::default()
+                });
                 if live > self.node_limit || max_depth > MAX_SAFE_LIVE_DAG_DEPTH {
                     return Stop::Diverged {
                         site: ip,
@@ -2633,29 +3433,70 @@ impl<'a> Emulator<'a> {
     pub fn discover_vip_slot(&mut self, start: u64, budget: usize) -> Option<u64> {
         const SAMPLE_EVERY: usize = 16;
         const WINDOW: u64 = 0x200;
-        let mut seen: HashMap<u64, HashSet<u64>> = HashMap::new();
-        let mut ip = start;
-        for i in 0..budget {
-            if self.pe.section_for_va(ip).is_none() {
-                break;
-            }
-            if i % SAMPLE_EVERY == 0 {
-                if let Some(base) = self.arena.as_const(self.state.reg(Reg::Rbp)) {
-                    for off in (0..WINDOW).step_by(8) {
-                        if let Some(v) = self.read_const_qword(base.wrapping_add(off)) {
-                            if self.in_vm(v) && Some(v) != self.unwind_slot {
-                                seen.entry(off).or_default().insert(v);
+        const MAX_NATIVE_PATHS: usize = 16;
+        // Entry wrappers may branch before constructing the VM frame. Each
+        // path and concrete RBP frame owns its observations: constants from
+        // different paths/frames must never manufacture a moving VIP slot.
+        type Seen = HashMap<u64, HashMap<u64, HashSet<u64>>>;
+        let mut queue = vec![(self.clone(), start, Seen::new())];
+        let mut total_steps = 0usize;
+        let mut paths = 1usize;
+        let mut candidates = HashSet::new();
+        while let Some((mut probe, mut ip, mut seen)) = queue.pop() {
+            loop {
+                if total_steps >= budget || probe.pe.section_for_va(ip).is_none() {
+                    break;
+                }
+                if probe.steps % SAMPLE_EVERY == 0 {
+                    if let Some(base) = probe.arena.as_const(probe.state.reg(Reg::Rbp)) {
+                        for off in (0..WINDOW).step_by(8) {
+                            if let Some(v) = probe.read_const_qword(base.wrapping_add(off)) {
+                                if probe.in_vm(v) && Some(v) != probe.unwind_slot {
+                                    seen.entry(base)
+                                        .or_default()
+                                        .entry(off)
+                                        .or_default()
+                                        .insert(v);
+                                }
                             }
                         }
                     }
                 }
+                total_steps += 1;
+                match probe.step(ip) {
+                    Step::Next(n) => ip = n,
+                    Step::Stopped(Stop::NativeBranch {
+                        predicate,
+                        taken,
+                        not_taken,
+                        ..
+                    }) if !seen.values().any(|frame| pick_vip_slot(frame).is_some()) => {
+                        if paths + 2 > MAX_NATIVE_PATHS {
+                            return None;
+                        }
+                        paths += 2;
+                        let mut taken_probe = probe.clone();
+                        taken_probe.pins.push((predicate, 1));
+                        let mut not_probe = probe.clone();
+                        not_probe.pins.push((predicate, 0));
+                        queue.push((taken_probe, taken, seen.clone()));
+                        queue.push((not_probe, not_taken, seen.clone()));
+                        break;
+                    }
+                    Step::Stopped(_) => break,
+                }
             }
-            match self.step(ip) {
-                Step::Next(n) => ip = n,
-                Step::Stopped(_) => break,
+            candidates.extend(seen.values().filter_map(pick_vip_slot));
+            let unfinished_path =
+                total_steps >= budget && !seen.values().any(|frame| pick_vip_slot(frame).is_some());
+            if candidates.len() > 1
+                || unfinished_path
+                || (total_steps >= budget && !queue.is_empty())
+            {
+                return None;
             }
         }
-        pick_vip_slot(&seen)
+        candidates.into_iter().next()
     }
 }
 
@@ -2897,6 +3738,16 @@ fn pick_vip_slot(seen: &HashMap<u64, HashSet<u64>>) -> Option<u64> {
         .max_by_key(|(off, vals)| (vals.len(), std::cmp::Reverse(**off)))
         .filter(|(_, vals)| vals.len() > 1)
         .map(|(off, _)| *off)
+}
+
+/// The value a pin set gives a node, if any.
+///
+/// First match wins, which is what makes appending a second pin for a node a no-op: the
+/// older entry is still found first. A caller that means to *change* a pinned value has
+/// to remove the old entry, not push another one; `Emulator::probe_pin` does exactly
+/// that, and `probe_pin_appended` exists so the two behaviours can be compared.
+fn first_pin(pins: &[(Ref, u64)], r: Ref) -> Option<u64> {
+    pins.iter().find(|(p, _)| *p == r).map(|(_, v)| *v)
 }
 
 #[cfg(test)]
@@ -3160,13 +4011,24 @@ mod compaction_tests {
         let mut control = compacting.clone();
         control.node_limit = usize::MAX;
         compacting.node_limit = compacting.arena.len() - 1;
+        crate::vm::diag::begin(START);
+        crate::vm::diag::set_pass(2);
 
         let control_stop = control.run(START, 1);
         let compacted_stop = compacting.run(START, 1);
+        let diagnostics = crate::vm::diag::take();
 
         assert!(matches!(control_stop, Stop::Return { .. }));
         assert!(matches!(compacted_stop, Stop::Return { .. }));
         assert!(compacting.arena.len() <= compacting.node_limit);
+        assert_eq!(diagnostics.compactions.len(), 1);
+        let record = &diagnostics.compactions[0];
+        assert_eq!(record.entry, START);
+        assert_eq!(record.pass, 2);
+        assert_eq!(record.site, START);
+        assert!(record.before > record.after);
+        assert!(record.after <= compacting.arena.len());
+        assert!(record.after <= compacting.node_limit);
     }
 
     #[test]
@@ -3238,6 +4100,90 @@ mod compaction_tests {
             emu.arena.op(retained[0]),
             &Op::Param(BlockRef(11), Reg::R12)
         );
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+    use crate::ir::expr::{Arena, Width};
+
+    /// Appending a pin for an already-pinned node cannot override it, because the
+    /// lookup is first-match-wins.
+    #[test]
+    fn a_later_pin_does_not_override_an_earlier_one() {
+        let mut a = Arena::default();
+        let x = a.opaque("x", Width::W64);
+        let y = a.opaque("y", Width::W64);
+        let z = a.opaque("z", Width::W64);
+        let pins = vec![(x, 1u64), (y, 7u64), (x, 0u64)];
+        assert_eq!(first_pin(&pins, x), Some(1), "the older entry wins");
+        assert_eq!(first_pin(&pins, y), Some(7));
+        assert_eq!(first_pin(&pins, z), None);
+    }
+
+    /// Removing the old entry is what lets a new value take effect, which is why a probe
+    /// that only pushed would report the wrong destination for the value it tested.
+    #[test]
+    fn removing_the_old_entry_is_what_lets_a_new_value_take_effect() {
+        let mut a = Arena::default();
+        let x = a.opaque("x", Width::W64);
+        let mut pins = vec![(x, 0u64)];
+        pins.push((x, 1));
+        assert_eq!(first_pin(&pins, x), Some(0), "appending changed nothing");
+        pins.retain(|(p, _)| *p != x);
+        pins.push((x, 1));
+        assert_eq!(
+            first_pin(&pins, x),
+            Some(1),
+            "the new value is now in force"
+        );
+    }
+
+    /// Diagnostics keep their stamps and stop being collected once taken, so a caller
+    /// that drains the sink cannot leak records into the next function.
+    #[test]
+    fn diagnostics_are_stamped_and_cleared() {
+        // Collection must stay opt-in: ordinary `Explorer::recover` callers never call
+        // `begin`, and a previous diagnostic is always shut down by `take`.
+        let _ = crate::vm::diag::take();
+        assert!(!crate::vm::diag::is_on());
+        crate::vm::diag::record_stop(crate::vm::diag::StopDiag::default());
+        assert!(crate::vm::diag::take().stops.is_empty(), "off means off");
+        crate::vm::diag::begin(0x1234);
+        crate::vm::diag::set_pass(2);
+        crate::vm::diag::record_stop(crate::vm::diag::StopDiag {
+            stop: "Diverged".into(),
+            ..Default::default()
+        });
+        let sink = crate::vm::diag::take();
+        assert_eq!(sink.stops.len(), 1);
+        assert_eq!(sink.stops[0].entry, 0x1234);
+        assert_eq!(sink.stops[0].pass, 2);
+        assert_eq!(sink.stops[0].stop, "Diverged");
+        assert_eq!(sink.final_pass, 2);
+        assert!(!crate::vm::diag::is_on());
+        crate::vm::diag::record_stop(crate::vm::diag::StopDiag::default());
+        assert!(crate::vm::diag::take().stops.is_empty());
+    }
+
+    #[test]
+    fn diagnostic_time_is_excluded_per_pass_only_while_collection_is_on() {
+        crate::vm::diag::begin(0x1234);
+        crate::vm::diag::set_pass(1);
+        crate::vm::diag::measure(|| {
+            let mut value = 0u64;
+            for i in 0..10_000 {
+                value = std::hint::black_box(value.wrapping_add(i));
+            }
+        });
+        assert!(crate::vm::diag::excluded_time() > std::time::Duration::ZERO);
+
+        crate::vm::diag::set_pass(2);
+        assert_eq!(crate::vm::diag::excluded_time(), std::time::Duration::ZERO);
+        let _ = crate::vm::diag::take();
+        crate::vm::diag::measure(|| {});
+        assert_eq!(crate::vm::diag::excluded_time(), std::time::Duration::ZERO);
     }
 }
 
@@ -3456,7 +4402,6 @@ mod predicate_split_tests {
     }
 }
 
-
 #[cfg(test)]
 mod segment_tests {
     use super::*;
@@ -3551,4 +4496,735 @@ fn callee_never_returns(pe: &PeFile, entry: u64) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod vm_return_tests {
+    use super::*;
+    use crate::binary::pe::{PeFile, Section};
+
+    const BASE: u64 = 0x1_4000_0000;
+    const ENTRY: u64 = BASE + 0x1000;
+    const STACK: u64 = 0x7fff_ffff_0000;
+
+    fn fixture(code: &[u8], section_name: &str) -> PeFile {
+        let mut data = vec![0; 0x400];
+        data[0x200..0x200 + code.len()].copy_from_slice(code);
+        PeFile {
+            data,
+            image_base: BASE,
+            entry_point_rva: 0x1000,
+            size_of_image: 0x2000,
+            sections: vec![Section {
+                name: section_name.into(),
+                virtual_address: 0x1000,
+                virtual_size: 0x100,
+                raw_address: 0x200,
+                raw_size: 0x100,
+                characteristics: 0x2000_0000,
+            }],
+            opt_header_offset: 0,
+            section_table_offset: 0,
+            file_alignment: 0x200,
+            section_alignment: 0x1000,
+            size_of_headers: 0x200,
+            loader_bound: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn sample_addresses_do_not_make_returning_callees_noreturn() {
+        // The research build used these four addresses as a noreturn allowlist.
+        // Another image may place ordinary returning functions at the same VAs.
+        // Their caller must still reach its own return and retain the call.
+        for target in [0x1817112f8u64, 0x181710ab8, 0x1817112bc, 0x181758120] {
+            let mut code = vec![0xe8];
+            code.extend_from_slice(&((target - (ENTRY + 5)) as i32).to_le_bytes());
+            code.extend_from_slice(&[0x90, 0xc3]);
+            let mut pe = fixture(&code, ".tvm0");
+            pe.data[0x300..0x306].copy_from_slice(&[0xb8, 42, 0, 0, 0, 0xc3]);
+            let rva = (target - BASE) as u32;
+            pe.sections.push(Section {
+                name: ".text".into(),
+                virtual_address: rva,
+                virtual_size: 0x100,
+                raw_address: 0x300,
+                raw_size: 0x100,
+                characteristics: 0x2000_0000,
+            });
+            pe.size_of_image = rva + 0x100;
+            let mut emu = Emulator::new(&pe, STACK);
+            assert!(matches!(emu.run(ENTRY, 20), Stop::Return { .. }), "{target:#x}");
+            assert_eq!(
+                emu.events.iter().filter(|event| matches!(event, Event::Call { .. })).count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn boxed_explicit_addresses_do_not_rehome_their_base_or_index() {
+        for code in [
+            &[0xf3, 0x0f, 0x11, 0x44, 0x24, 0x70][..], // movss [rsp+70h],xmm0
+            &[0xf3, 0x0f, 0x10, 0x44, 0x88, 0x70][..], // movss xmm0,[rax+rcx*4+70h]
+        ] {
+            let pe = fixture(code, ".tvm0");
+            let mut emu = Emulator::new(&pe, STACK);
+            let mut decoder = iced_x86::Decoder::with_ip(64, code, ENTRY, 0);
+            let inst = decoder.decode();
+            assert!(emu.boxed_uses(&inst, true).is_empty());
+        }
+    }
+
+    #[test]
+    fn boxed_address_relocation_keeps_real_implicit_and_rsp_data_inputs() {
+        let pe = fixture(&[0xc3], ".tvm0");
+        let mut emu = Emulator::new(&pe, STACK);
+        for (code, relocated, required) in [
+            (&[0x0f, 0xb1, 0x08][..], true, Register::RAX), // cmpxchg [rax],ecx: implicit accumulator
+            (&[0x48, 0x89, 0x24, 0x24][..], true, Register::RSP), // mov [rsp],rsp: data, not just address
+            (&[0xff, 0x74, 0x24, 0x08][..], true, Register::RSP), // push [rsp+8]: implicit stack
+            (&[0x66, 0x0f, 0x6e, 0xc4][..], false, Register::RSP), // movd xmm0,esp: actual data source
+        ] {
+            let mut decoder = iced_x86::Decoder::with_ip(64, code, ENTRY, 0);
+            let uses = emu.boxed_uses(&decoder.decode(), relocated);
+            assert!(uses.iter().any(|(r, _)| r.full_register() == required), "{code:02x?}: {uses:?}");
+        }
+        let mut decoder = iced_x86::Decoder::with_ip(64, &[0xf3, 0x48, 0xa5], ENTRY, 0);
+        let uses = emu.boxed_uses(&decoder.decode(), false); // rep movsq: implicit addresses remain native
+        for required in [Register::RDI, Register::RSI, Register::RCX] {
+            assert!(uses.iter().any(|(r, _)| r.full_register() == required));
+        }
+    }
+
+    #[test]
+    fn symbolic_forwarding_follows_a_dynamic_vm_frame_and_stops_at_guest_calls() {
+        let pe = fixture(&[0xc3], ".tvm0");
+        let mut emu = Emulator::new(&pe, STACK);
+        let size = emu.arena.opaque("dynamic-frame-size", Width::W64);
+        let top = emu.arena.constant(STACK, Width::W64);
+        let frame = emu.arena.bin(BinOp::Sub, top, size);
+        let offset = emu.arena.constant(0x1fc0, Width::W64);
+        let addr = emu.arena.bin(BinOp::Sub, frame, offset);
+        let vip = emu.arena.constant(BASE + 0x1000, Width::W64);
+        emu.store(addr, vip, Width::W64, ENTRY);
+        let read = emu.load(addr, Width::W64, ENTRY + 1);
+        assert_eq!(read, vip);
+        let two = emu.arena.constant(2, Width::W64);
+        let subaddr = emu.arena.bin(BinOp::Add, addr, two);
+        let word = emu.load(subaddr, Width::W16, ENTRY + 2);
+        assert_eq!(
+            emu.arena.as_const(word),
+            Some((BASE + 0x1000) >> 16 & 0xffff)
+        );
+        emu.clobber_call();
+        let after = emu.load(addr, Width::W64, ENTRY + 3);
+        assert!(matches!(emu.arena.op(after), crate::ir::expr::Op::Load(..)));
+        assert_ne!(after, vip);
+    }
+
+    #[test]
+    fn symbolic_forwarding_does_not_rewrite_old_loads_or_survive_boxed_writes() {
+        let pe = fixture(&[0xc3], ".tvm0");
+        let mut emu = Emulator::new(&pe, STACK);
+        let addr = emu.arena.opaque("dynamic-pointer", Width::W64);
+        let before = emu.load(addr, Width::W64, ENTRY);
+        let vip = emu.arena.constant(BASE + 0x1000, Width::W64);
+        emu.store(addr, vip, Width::W64, ENTRY + 1);
+        assert_eq!(emu.load(addr, Width::W64, ENTRY + 2), vip);
+        assert!(matches!(
+            emu.arena.op(before),
+            crate::ir::expr::Op::Load(..)
+        ));
+        emu.forget_memory(addr, 16);
+        let after = emu.load(addr, Width::W64, ENTRY + 3);
+        assert!(matches!(emu.arena.op(after), crate::ir::expr::Op::Load(..)));
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn symbolic_forwarding_stops_at_implicit_boxed_memory_writes() {
+        for code in [
+            &[0xf3, 0x48, 0xab][..],       // rep stosq: implicit [RDI]
+            &[0xf3, 0x48, 0xa5][..],       // rep movsq: implicit [RDI], [RSI]
+            &[0x66, 0x0f, 0xf7, 0xc1][..], // maskmovdqu xmm0,xmm1: implicit [RDI]
+        ] {
+            let pe = fixture(code, ".tvm0");
+            let mut emu = Emulator::new(&pe, STACK);
+            let addr = emu.arena.opaque("dynamic-destination", Width::W64);
+            let value = emu.arena.constant(0x1234, Width::W64);
+            emu.state.set_reg(Reg::Rdi, addr);
+            emu.store(addr, value, Width::W64, ENTRY - 1);
+            assert_eq!(emu.load(addr, Width::W64, ENTRY - 1), value);
+            assert!(matches!(emu.step(ENTRY), Step::Next(_)));
+            let after = emu.load(addr, Width::W64, ENTRY + code.len() as u64);
+            assert!(
+                matches!(emu.arena.op(after), crate::ir::expr::Op::Load(..)),
+                "boxed {code:02x?} retained stale store"
+            );
+        }
+    }
+
+    fn vip_probe_arm(slot: u32, pointers: &[u64]) -> Vec<u8> {
+        let mut code = vec![0x48, 0xbd]; // mov rbp, concrete VM frame
+        code.extend((STACK - 0x200).to_le_bytes());
+        for pointer in pointers {
+            code.extend([0x48, 0xb8]); // mov rax, pointer
+            code.extend(pointer.to_le_bytes());
+            code.extend([0x48, 0x89, 0x85]); // mov [rbp+slot], rax
+            code.extend(slot.to_le_bytes());
+            code.extend([0x90; 16]); // enough time to sample the stored pointer
+        }
+        code.push(0xc3);
+        code
+    }
+
+    fn vip_probe_diamond(left: &[u8], right: &[u8]) -> PeFile {
+        let mut code = vec![0x48, 0x85, 0xc9, 0x0f, 0x84]; // test rcx,rcx; je right
+        code.extend((left.len() as u32).to_le_bytes());
+        code.extend(left);
+        code.extend(right);
+        fixture(&code, ".tvm0")
+    }
+
+    #[test]
+    fn vip_probe_follows_native_entry_branches_before_the_vm_frame_exists() {
+        let arm = vip_probe_arm(0x60, &[ENTRY + 1, ENTRY + 2]);
+        for pe in [
+            vip_probe_diamond(&arm, &[0xc3]),
+            vip_probe_diamond(&[0xc3], &arm),
+        ] {
+            let mut emu = Emulator::new(&pe, STACK);
+            assert_eq!(emu.discover_vip_slot(ENTRY, 300), Some(0x60));
+        }
+    }
+
+    #[test]
+    fn vip_probe_does_not_merge_constants_from_independent_paths() {
+        let left = vip_probe_arm(0x60, &[ENTRY + 1]);
+        let right = vip_probe_arm(0x60, &[ENTRY + 2]);
+        let pe = vip_probe_diamond(&left, &right);
+        let mut emu = Emulator::new(&pe, STACK);
+        assert_eq!(emu.discover_vip_slot(ENTRY, 300), None);
+    }
+
+    #[test]
+    fn vip_probe_rejects_disagreeing_path_slots_and_budget_exhaustion() {
+        let left = vip_probe_arm(0x60, &[ENTRY + 1, ENTRY + 2]);
+        let right = vip_probe_arm(0x90, &[ENTRY + 3, ENTRY + 4]);
+        let pe = vip_probe_diamond(&left, &right);
+        let mut emu = Emulator::new(&pe, STACK);
+        assert_eq!(emu.discover_vip_slot(ENTRY, 300), None);
+        let pe = vip_probe_diamond(&left, &[0xc3]);
+        let mut emu = Emulator::new(&pe, STACK);
+        assert_eq!(emu.discover_vip_slot(ENTRY, 1), None);
+    }
+
+    #[test]
+    fn vip_probe_rejects_an_unfinished_last_path_after_an_earlier_candidate() {
+        let left = vip_probe_arm(0x60, &[ENTRY + 1, ENTRY + 2]);
+        let mut right = vec![0x90; 80];
+        right.extend(vip_probe_arm(0x90, &[ENTRY + 3, ENTRY + 4]));
+        let pe = vip_probe_diamond(&left, &right);
+        let mut emu = Emulator::new(&pe, STACK);
+        assert_eq!(emu.discover_vip_slot(ENTRY, 70), None);
+    }
+
+    #[test]
+    fn inline_vm_call_returns_to_its_continuation_before_guest_return() {
+        // call helper; mov eax,42; ret; helper: mov eax,7; ret
+        // The first RET is VM control flow, not the recovered guest's exit.
+        let pe = fixture(
+            &[
+                0xe8, 6, 0, 0, 0, 0xb8, 42, 0, 0, 0, 0xc3, 0xb8, 7, 0, 0, 0, 0xc3,
+            ],
+            ".tvm0",
+        );
+        let mut emu = Emulator::new(&pe, STACK);
+        let stop = emu.run(ENTRY, 20);
+        assert!(matches!(stop, Stop::Return { site, .. } if site == ENTRY + 10));
+        assert_eq!(emu.arena.as_const(emu.state.reg(Reg::Rax)), Some(42));
+        assert_eq!(emu.state.concrete_rsp(&emu.arena), Some(STACK + 8));
+        assert!(
+            !emu.events
+                .iter()
+                .any(|event| matches!(event, Event::Call { .. }))
+        );
+    }
+
+    #[test]
+    fn vm_ret_imm_cleans_arguments_before_resuming() {
+        // push 7; call helper; mov eax,42; ret; helper: ret 8
+        let pe = fixture(
+            &[
+                0x6a, 7, 0xe8, 6, 0, 0, 0, 0xb8, 42, 0, 0, 0, 0xc3, 0xc2, 8, 0,
+            ],
+            ".tvm0",
+        );
+        let mut emu = Emulator::new(&pe, STACK);
+        let stop = emu.run(ENTRY, 20);
+        assert!(matches!(stop, Stop::Return { site, .. } if site == ENTRY + 12));
+        assert_eq!(emu.arena.as_const(emu.state.reg(Reg::Rax)), Some(42));
+        assert_eq!(emu.state.concrete_rsp(&emu.arena), Some(STACK + 8));
+    }
+
+    #[test]
+    fn concrete_native_return_is_still_a_guest_exit() {
+        let pe = fixture(&[0xc3], ".text");
+        let mut emu = Emulator::new(&pe, STACK);
+        let target = emu.arena.constant(ENTRY, Width::W64);
+        emu.push(target, Width::W64, ENTRY);
+        let stop = emu.run(ENTRY, 20);
+        assert!(
+            matches!(stop, Stop::Return { dest, .. } if emu.arena.as_const(dest) == Some(ENTRY))
+        );
+        assert_eq!(emu.state.concrete_rsp(&emu.arena), Some(STACK));
+    }
+
+    #[test]
+    fn stack_probe_preserves_registers_flags_and_argument_cleanup() {
+        for (cmp, expected) in [(42, 1), (41, 2)] {
+            // mov eax,42; mov ecx,1234h; push 2000h; cmp eax,<cmp>;
+            // call probe; jne other; mov edx,1; ret; other: mov edx,2; ret
+            let mut code = vec![
+                0xb8, 42, 0, 0, 0, 0xb9, 0x34, 0x12, 0, 0, 0x68, 0, 0x20, 0, 0, 0x83, 0xf8, cmp,
+                0xe8, 0x29, 0, 0, 0, 0x75, 6, 0xba, 1, 0, 0, 0, 0xc3, 0xba, 2, 0, 0, 0, 0xc3,
+            ];
+            code.resize(0x40, 0xcc);
+            code.extend_from_slice(&TVM_STACK_PROBE);
+            let pe = fixture(&code, ".tvm0");
+            // Check both the real instruction loop and the experimental model.
+            for summarize in [false, true] {
+                let mut emu = Emulator::new(&pe, STACK);
+                emu.experimental_stack_probe_summary = summarize;
+                let stop = emu.run(ENTRY, 100);
+                assert!(matches!(stop, Stop::Return { .. }));
+                assert_eq!(emu.arena.as_const(emu.state.reg(Reg::Rax)), Some(42));
+                assert_eq!(emu.arena.as_const(emu.state.reg(Reg::Rcx)), Some(0x1234));
+                assert_eq!(emu.arena.as_const(emu.state.reg(Reg::Rdx)), Some(expected));
+                assert_eq!(emu.state.concrete_rsp(&emu.arena), Some(STACK + 8));
+                assert!(!emu.events.iter().any(|e| matches!(e, Event::Call { .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn stack_probe_summary_preserves_symbolic_state() {
+        // push rdx; call probe; ret. RDX and the flags are symbolic.
+        let mut code = vec![0x52, 0xe8, 2, 0, 0, 0, 0xc3, 0xcc];
+        code.extend_from_slice(&TVM_STACK_PROBE);
+        let pe = fixture(&code, ".tvm0");
+        let mut emu = Emulator::new(&pe, STACK);
+        emu.experimental_stack_probe_summary = true;
+        assert!(matches!(emu.step(ENTRY), Step::Next(ip) if ip == ENTRY + 1));
+        let before = emu.state.clone();
+        let event_count = emu.events.len();
+        assert!(matches!(emu.step(ENTRY + 1), Step::Next(ip) if ip == ENTRY + 6));
+        for reg in crate::ir::expr::GPRS {
+            if reg != Reg::Rsp {
+                assert_eq!(emu.state.reg(reg), before.reg(reg));
+            }
+        }
+        assert_eq!(emu.state.flags, before.flags);
+        assert_eq!(emu.state.sym_stores, before.sym_stores);
+        assert!(emu.state.mem.len() >= before.mem.len());
+        let saved_flags = before.pack_flags(&mut emu.arena);
+        let return_address = emu.arena.constant(ENTRY + 6, Width::W64);
+        for (address, expected) in [
+            (STACK - 16, return_address),
+            (STACK - 24, saved_flags),
+            (STACK - 32, before.reg(Reg::Rcx)),
+            (STACK - 40, before.reg(Reg::Rax)),
+        ] {
+            let actual = emu
+                .state
+                .load_concrete(&mut emu.arena, address, Width::W64, |_| None);
+            assert_eq!(actual, Some(expected), "helper save slot {address:#x}");
+        }
+        assert_eq!(emu.events.len(), event_count + 5);
+        assert!(matches!(emu.events.last(), Some(Event::StackProbe { .. })));
+        assert_eq!(emu.state.concrete_rsp(&emu.arena), Some(STACK));
+    }
+
+    #[test]
+    fn altered_stack_probe_falls_back_to_inline_vm_call() {
+        let mut code = vec![0x52, 0xe8, 2, 0, 0, 0, 0xc3, 0xcc];
+        code.extend_from_slice(&TVM_STACK_PROBE);
+        // A different stack cleanup is not the recognized helper.
+        code[8 + TVM_STACK_PROBE.len() - 2] = 16;
+        let pe = fixture(&code, ".tvm0");
+        let mut emu = Emulator::new(&pe, STACK);
+        emu.experimental_stack_probe_summary = true;
+        emu.step(ENTRY);
+        assert!(!is_tvm_stack_probe(&pe, ENTRY + 8));
+        assert!(matches!(emu.step(ENTRY + 1), Step::Next(ip) if ip == ENTRY + 8));
+        assert_eq!(emu.state.concrete_rsp(&emu.arena), Some(STACK - 16));
+    }
+
+    #[test]
+    fn stack_probe_default_recovery_retains_page_effect() {
+        let mut code = vec![0x52, 0xe8, 2, 0, 0, 0, 0xc3, 0xcc];
+        code.extend_from_slice(&TVM_STACK_PROBE);
+        let pe = fixture(&code, ".tvm0");
+        let mut emu = Emulator::new(&pe, STACK);
+        emu.step(ENTRY);
+        assert!(is_tvm_stack_probe(&pe, ENTRY + 8));
+        assert!(matches!(emu.step(ENTRY + 1), Step::Next(ip) if ip == ENTRY + 6));
+        assert_eq!(emu.state.concrete_rsp(&emu.arena), Some(STACK));
+    }
+}
+
+#[cfg(test)]
+mod native_vtable_tail_tests {
+    use super::*;
+    use crate::binary::pe::{PeFile, Section};
+
+    const BASE: u64 = 0x1_6000_0000;
+    const ENTRY: u64 = BASE + 0x1000;
+    const STACK: u64 = 0x7fff_ffff_0000;
+
+    fn fixture(code: &[u8]) -> PeFile {
+        let mut data = vec![0; 0x400];
+        data[0x200..0x200 + code.len()].copy_from_slice(code);
+        PeFile {
+            data,
+            image_base: BASE,
+            entry_point_rva: 0x1000,
+            size_of_image: 0x2000,
+            sections: vec![Section {
+                name: ".tvm0".into(),
+                virtual_address: 0x1000,
+                virtual_size: 0x100,
+                raw_address: 0x200,
+                raw_size: 0x100,
+                characteristics: 0x2000_0000,
+            }],
+            opt_header_offset: 0,
+            section_table_offset: 0,
+            file_alignment: 0x200,
+            section_alignment: 0x1000,
+            size_of_headers: 0x200,
+            loader_bound: Vec::new(),
+        }
+    }
+
+    fn relocated_thunk() -> PeFile {
+        let mut code = NATIVE_VTABLE_THUNK;
+        // Exercise both displacement signs, at an unrelated image address.
+        code[32..40].copy_from_slice(&(ENTRY + 53 + 0x100).to_le_bytes());
+        code[44..48].copy_from_slice(&(-0x100i32).to_le_bytes());
+        code[72..80].copy_from_slice(&(ENTRY + 16 - 0x200).to_le_bytes());
+        code[84..88].copy_from_slice(&(0x200i32).to_le_bytes());
+        fixture(&code)
+    }
+
+    fn at_tail(pe: &PeFile) -> (Emulator<'_>, u64, Ref) {
+        let mut emu = Emulator::new(pe, STACK);
+        let Stop::NativeBranch {
+            predicate,
+            not_taken,
+            ..
+        } = emu.run(ENTRY, 100)
+        else {
+            panic!("missing native null check");
+        };
+        emu.pins.push((predicate, 0));
+        let Stop::SymbolicBranch { site, dest } = emu.run(not_taken, 100) else {
+            panic!("missing vtable branch");
+        };
+        (emu, site, dest)
+    }
+
+    #[test]
+    fn audited_native_vtable_thunk_keeps_null_return_and_nonnull_tail_separate() {
+        let pe = relocated_thunk();
+        let (emu, site, dest) = at_tail(&pe);
+        assert!(emu.proves_native_vtable_tail(site, dest));
+        assert_eq!(
+            crate::ir::expr::render(&emu.arena, dest, 6),
+            "load64[load64[rcx]]"
+        );
+        assert_eq!(emu.state.concrete_rsp(&emu.arena), Some(STACK));
+        assert_eq!(emu.arena.as_const(emu.state.reg(Reg::Rdx)), Some(1));
+        for reg in [
+            Reg::Rcx,
+            Reg::R8,
+            Reg::R9,
+            Reg::Rbx,
+            Reg::Rbp,
+            Reg::Rsi,
+            Reg::Rdi,
+            Reg::R12,
+            Reg::R13,
+            Reg::R14,
+            Reg::R15,
+        ] {
+            assert!(
+                matches!(emu.arena.op(emu.state.reg(reg)), Op::InitReg(original) if *original == reg)
+            );
+        }
+
+        let cfg = crate::vm::explore::Explorer::new(&pe, STACK).recover(ENTRY);
+        assert_eq!(cfg.blocks.len(), 3);
+        assert_eq!(cfg.total_steps, 26);
+        assert_eq!(cfg.unresolved, 0);
+        assert!(crate::vm::explore::validate(&cfg).is_clean());
+        let mut tails = 0;
+        let mut returns = 0;
+        for block in &cfg.blocks {
+            match block.terminator {
+                crate::ir::Terminator::IndirectTailCall { target } => {
+                    tails += 1;
+                    assert!(!block.from_vm_context);
+                    assert_eq!(
+                        crate::ir::expr::render(&cfg.arena, target, 6),
+                        "load64[load64[rcx]]"
+                    );
+                    let rsp = block
+                        .exit_regs
+                        .iter()
+                        .find(|(r, _)| *r == Reg::Rsp)
+                        .unwrap()
+                        .1;
+                    assert_eq!(cfg.arena.as_const(rsp), Some(STACK));
+                }
+                crate::ir::Terminator::Return { dest } => {
+                    returns += 1;
+                    let Op::Load(addr, _) = cfg.arena.op(dest) else {
+                        panic!("caller return lost");
+                    };
+                    assert_eq!(cfg.arena.as_const(*addr), Some(STACK));
+                }
+                _ => {}
+            }
+        }
+        assert_eq!((tails, returns), (1, 1));
+    }
+
+    #[test]
+    fn no_vip_and_guest_pointer_do_not_prove_a_native_tail() {
+        // Same pointer shape and ABI-looking state, but no audited instruction
+        // history: an unknown dispatcher must remain unresolved.
+        let pe = fixture(&[0x48, 0x8b, 0x01, 0xba, 1, 0, 0, 0, 0xff, 0x20]);
+        let mut emu = Emulator::new(&pe, STACK);
+        let Stop::SymbolicBranch { site, dest } = emu.run(ENTRY, 20) else {
+            panic!();
+        };
+        assert!(emu.current_vip().is_none() && emu.guest_ctx.is_none());
+        assert!(!emu.proves_native_vtable_tail(site, dest));
+        let cfg = crate::vm::explore::Explorer::new(&pe, STACK).recover(ENTRY);
+        assert_eq!(cfg.unresolved, 1);
+        assert!(matches!(
+            cfg.blocks[0].terminator,
+            crate::ir::Terminator::Unresolved { .. }
+        ));
+    }
+
+    #[test]
+    fn audited_tail_rejects_vm_state_stack_damage_and_argument_changes() {
+        let pe = relocated_thunk();
+        let (emu, site, dest) = at_tail(&pe);
+        for damage in 0..7 {
+            let mut changed = emu.clone();
+            match damage {
+                0 => changed.guest_ctx = Some(STACK - 0x100),
+                1 => changed.vip_slot = Some(8),
+                2 => {
+                    let value = changed.arena.constant(STACK - 8, Width::W64);
+                    changed.state.set_reg(Reg::Rsp, value);
+                }
+                3 => {
+                    let value = changed.arena.constant(7, Width::W64);
+                    changed
+                        .state
+                        .store_concrete(&changed.arena, STACK, value, Width::W64);
+                }
+                4 => {
+                    let value = changed.arena.constant(7, Width::W64);
+                    changed.state.set_reg(Reg::R8, value);
+                }
+                5 => changed.state.sym_stores.push((dest, dest, Width::W64)),
+                6 => changed.trace.pop_front().map(|_| ()).unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(
+                !changed.proves_native_vtable_tail(site, dest),
+                "damage {damage}"
+            );
+        }
+        assert!(!emu.proves_native_vtable_tail(site, emu.state.reg(Reg::Rax)));
+    }
+
+    #[test]
+    fn modified_thunk_is_not_whitelisted_by_address_or_shape() {
+        let mut pe = relocated_thunk();
+        // EDX will become 2 instead of 1; all calculated branches still work.
+        pe.data[0x200 + 64] = 0xfd;
+        let (emu, site, dest) = at_tail(&pe);
+        assert_eq!(emu.arena.as_const(emu.state.reg(Reg::Rdx)), Some(2));
+        assert!(!emu.proves_native_vtable_tail(site, dest));
+    }
+
+    fn call_fixture(shape: usize, relay: usize) -> PeFile {
+        let mut code = match relay {
+            0 => Vec::new(),
+            1 => {
+                // push r11; lea r11,[rip+0x100]; lea r11,[r11-0xf5];
+                // jmp r11; int3 (not visited); pop r11.
+                vec![
+                    0x41, 0x53, 0x4c, 0x8d, 0x1d, 0, 1, 0, 0, 0x4d, 0x8d, 0x9b, 0x0b, 0xff, 0xff,
+                    0xff, 0x41, 0xff, 0xe3, 0xcc, 0x41, 0x5b,
+                ]
+            }
+            2 => {
+                // push r10; movabs r10, target-0x123; pushfq; add r10,0x123;
+                // popfq; jmp r10; int3; pop r10. Both relay forms relocate.
+                let mut bytes = vec![0x41, 0x52, 0x49, 0xba];
+                bytes.extend_from_slice(&(ENTRY + 25 - 0x123).to_le_bytes());
+                bytes.extend_from_slice(&[
+                    0x9c, 0x49, 0x81, 0xc2, 0x23, 1, 0, 0, 0x9d, 0x41, 0xff, 0xe2, 0xcc, 0x41, 0x5a,
+                ]);
+                bytes
+            }
+            _ => unreachable!(),
+        };
+        let core_offset = code.len();
+        code.extend_from_slice(NATIVE_CALL_TAILS[shape].core);
+        let mut decoder = iced_x86::Decoder::with_ip(
+            64,
+            &code[core_offset..],
+            ENTRY + core_offset as u64,
+            iced_x86::DecoderOptions::NONE,
+        );
+        let mut call_offset = None;
+        while decoder.can_decode() {
+            let inst = decoder.decode();
+            if inst.mnemonic() == Mnemonic::Call {
+                call_offset = Some((inst.ip() - ENTRY) as usize);
+            }
+        }
+        let call_offset = call_offset.unwrap();
+        let helper = BASE + 0x2000;
+        code[call_offset + 1..call_offset + 5]
+            .copy_from_slice(&((helper - (ENTRY + call_offset as u64 + 5)) as i32).to_le_bytes());
+        let mut pe = fixture(&code);
+        pe.data.resize(0x800, 0);
+        pe.data[0x400] = 0xc3;
+        pe.sections[0].raw_size = 0x200;
+        pe.sections[0].virtual_size = 0x200;
+        pe.sections.push(Section {
+            name: ".text".into(),
+            virtual_address: 0x2000,
+            virtual_size: 0x200,
+            raw_address: 0x400,
+            raw_size: 0x200,
+            characteristics: 0x2000_0000,
+        });
+        pe.size_of_image = 0x3000;
+        pe
+    }
+
+    fn call_tail(pe: &PeFile) -> (Emulator<'_>, u64, Ref) {
+        let mut emu = Emulator::new(pe, STACK);
+        let stop = emu.run(ENTRY, 200);
+        let Stop::SymbolicBranch { site, dest } = stop else {
+            panic!("expected register tail, got {stop:?}");
+        };
+        (emu, site, dest)
+    }
+
+    #[test]
+    fn audited_call_tail_cores_and_both_relocated_relay_forms_close() {
+        for shape in 0..NATIVE_CALL_TAILS.len() {
+            for relay in 0..3 {
+                let pe = call_fixture(shape, relay);
+                let (emu, site, dest) = call_tail(&pe);
+                assert!(
+                    emu.proves_native_call_tail(site, dest),
+                    "shape {shape}, relay {relay}: registers={:?}, loads={:?}, events={:?}",
+                    crate::ir::expr::GPRS
+                        .map(|r| (r, crate::ir::expr::render(&emu.arena, emu.state.reg(r), 6))),
+                    emu.symbolic_loads,
+                    emu.events,
+                );
+                let cfg = crate::vm::explore::Explorer::new(&pe, STACK).recover(ENTRY);
+                assert_eq!(cfg.blocks.len(), 1);
+                assert_eq!(cfg.unresolved, 0);
+                assert!(crate::vm::explore::validate(&cfg).is_clean());
+                assert!(matches!(
+                    cfg.blocks[0].terminator,
+                    crate::ir::Terminator::IndirectTailCall { .. }
+                ));
+                assert_eq!(
+                    cfg.blocks[0]
+                        .events
+                        .iter()
+                        .filter(|e| matches!(e, Event::Call { .. }))
+                        .count(),
+                    1
+                );
+                assert!(!cfg.blocks[0].from_vm_context);
+            }
+        }
+    }
+
+    #[test]
+    fn audited_call_tail_rejects_missing_call_bad_stack_and_changed_arguments() {
+        for shape in 0..NATIVE_CALL_TAILS.len() {
+            let pe = call_fixture(shape, 1);
+            let (emu, site, dest) = call_tail(&pe);
+            for damage in 0..8 {
+                let mut changed = emu.clone();
+                match damage {
+                    0 => changed.events.retain(|e| !matches!(e, Event::Call { .. })),
+                    1 => changed.guest_ctx = Some(STACK - 0x100),
+                    2 => changed.trace.pop_front().map(|_| ()).unwrap(),
+                    3 => {
+                        let wrong = changed.arena.constant(STACK - 8, Width::W64);
+                        changed.state.set_reg(Reg::Rsp, wrong);
+                    }
+                    4 => {
+                        let wrong = changed.arena.constant(0, Width::W64);
+                        changed.state.set_reg(Reg::Rcx, wrong);
+                    }
+                    5 => {
+                        let wrong = changed.arena.constant(0, Width::W64);
+                        changed.state.set_reg(Reg::Rbx, wrong);
+                    }
+                    6 => {
+                        changed
+                            .state
+                            .store_concrete(&changed.arena, STACK, dest, Width::W64);
+                    }
+                    7 => changed.pins.push((dest, 1)),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    !changed.proves_native_call_tail(site, dest),
+                    "shape {shape}, damage {damage}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn audited_call_tail_requires_full_core_and_correct_relay_target() {
+        let mut pe = call_fixture(0, 1);
+        // Inserting an extra NOP changes the complete core although it happens
+        // to preserve this final register state; unreviewed cores stay closed.
+        pe.data[0x200 + 20] = 0x90; // replace POP's REX byte with NOP
+        let (emu, site, dest) = call_tail(&pe);
+        assert!(!emu.proves_native_call_tail(site, dest));
+
+        let pe = call_fixture(0, 2);
+        let (emu, _, _) = call_tail(&pe);
+        let mut trace: Vec<_> = emu
+            .trace
+            .iter()
+            .map(|&ip| disasm::decode_at(&pe, ip).unwrap())
+            .collect();
+        assert_eq!(native_tail_relay(&trace), Some(7));
+        trace[3].set_immediate32(0x124);
+        assert_eq!(native_tail_relay(&trace), None);
+    }
 }

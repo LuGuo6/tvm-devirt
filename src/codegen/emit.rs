@@ -438,6 +438,9 @@ pub(crate) fn emit_instr(
     redirect: &CallRedirects,
 ) -> Result<()> {
     match instr {
+        Instr::StackProbe { top, size } => {
+            emit_stack_probe(asm, alloc, top, size, pos, layout)?;
+        }
         Instr::Opaque {
             dst,
             tag,
@@ -465,6 +468,21 @@ pub(crate) fn emit_instr(
             text,
             uses,
         } => {
+            // Ordinary explicit addresses are relocated separately. A remaining
+            // RSP data input, output, or stack instruction needs a model we do
+            // not have; materializing it would corrupt the emitter's fixed frame.
+            let mut decoder = iced_x86::Decoder::with_ip(64, bytes, *site, iced_x86::DecoderOptions::NONE);
+            let mut stack_check = decoder.decode();
+            if mem.is_some() {
+                stack_check.set_memory_base(iced_x86::Register::None);
+                stack_check.set_memory_index(iced_x86::Register::None);
+            }
+            let mut info_factory = iced_x86::InstructionInfoFactory::new();
+            let uses_physical_rsp = info_factory.info(&stack_check).used_registers().iter()
+                .any(|r| r.register().full_register() == iced_x86::Register::RSP);
+            if uses_physical_rsp || uses.iter().any(|(r, _)| *r == Reg::Rsp) {
+                bail!("boxed instruction at {site:#x} ({text}) needs unsupported guest RSP data/stack semantics");
+            }
             // The implicit register reads first: `cpuid`'s leaf in EAX, `rdmsr`'s MSR index in ECX, `rep stosb`'s RDI/RCX/AL. The re-emitted encoding names the VM's registers, so without this the instruction runs against whatever the allocator left there.
             emit_call_args(asm, alloc, uses, pos, layout)?;
             emit_boxed(asm, alloc, *site, bytes, mem.as_ref(), text, pos, layout)?;
@@ -574,6 +592,51 @@ pub(crate) fn emit_instr(
             None => {}
         },
     }
+    Ok(())
+}
+
+/// The original helper's ordered byte-read loop, operating on relocated guest
+/// addresses. RSP stays fixed even at a faulting TEST, so the function's normal
+/// unwind record applies. All GPRs are preserved in private frame slots. Flags
+/// are ordinary compiler temporaries: their guest expressions remain unchanged
+/// in the lifter, and each use is materialized/recompared by normal codegen.
+pub(crate) fn emit_stack_probe(
+    asm: &mut CodeAssembler,
+    alloc: &Alloc,
+    top: &Operand,
+    size: &Operand,
+    pos: usize,
+    layout: &FrameLayout,
+) -> Result<()> {
+    let save_rax = layout.scratch_slot_disp(0) as i32;
+    let save_rcx = layout.scratch_slot_disp(1) as i32;
+    asm.mov(qword_ptr(rsp + save_rax), rax)?;
+    asm.mov(qword_ptr(rsp + save_rcx), rcx)?;
+    // Both inputs are read from the pre-loop state, including a register cycle
+    // (top in RAX, size in RCX). Read a saved register from its private slot.
+    for (dst, input) in [(Reg::Rcx, top), (Reg::Rax, size)] {
+        match resolve(alloc, input, pos) {
+            Some(Loc::Reg(Reg::Rax)) => asm.mov(qreg(dst), qword_ptr(rsp + save_rax))?,
+            Some(Loc::Reg(Reg::Rcx)) => asm.mov(qreg(dst), qword_ptr(rsp + save_rcx))?,
+            Some(Loc::Reg(src)) => asm.mov(qreg(dst), qreg(src))?,
+            Some(Loc::Spill(slot)) => asm.mov(qreg(dst), qword_ptr(rsp + layout.spill_disp(slot) as i32))?,
+            None if matches!(input, Operand::Imm(_) | Operand::Frame(_)) => {
+                emit_mov_operand_imm_or_frame(asm, dst, input, Width::W64, layout)?;
+            }
+            None => bail!("stack probe input has no allocated location: {input:?}"),
+        }
+    }
+    asm.neg(rax)?;
+    asm.add(rax, rcx)?;
+    asm.and(cx, 0xf000)?;
+    let mut again = asm.create_label();
+    asm.set_label(&mut again)?;
+    asm.lea(rcx, qword_ptr(rcx - 0x1000))?;
+    asm.test(byte_ptr(rcx), al)?;
+    asm.cmp(rcx, rax)?;
+    asm.jge(again)?;
+    asm.mov(rax, qword_ptr(rsp + save_rax))?;
+    asm.mov(rcx, qword_ptr(rsp + save_rcx))?;
     Ok(())
 }
 

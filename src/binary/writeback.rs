@@ -9,7 +9,7 @@ use crate::codegen;
 use crate::ir;
 use crate::ir::regalloc;
 use crate::ir::sched;
-use crate::vm::discover::VmEntry;
+use crate::vm::discover::{self, VmEntry};
 use crate::vm::explore;
 use anyhow::{Context, Result, bail};
 
@@ -19,7 +19,7 @@ pub struct DevirtReport {
     pub retargeted: usize,
     /// Recovery did not finish
     pub incomplete: Vec<(u64, String)>,
-    /// Recovery finished but codegen refused, with the reason.
+    /// Entry patching or code generation was rejected, with the reason.
     pub failed: Vec<(u64, String)>,
     /// Image was signed and the signature has been removed.
     pub dropped_signature: bool,
@@ -34,7 +34,7 @@ impl DevirtReport {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct RuntimeFunction {
     begin: u32,
     end: u32,
@@ -102,16 +102,87 @@ fn pe_checksum(data: &[u8], checksum_offset: usize) -> u32 {
     sum + data.len() as u32
 }
 
+/// Reject entries whose five-byte redirect would overwrite another entry or
+/// cross a known function/section boundary. Discovery can identify swallowed
+/// functions shorter than a JMP; identification alone is not permission to
+/// overwrite their neighbours. Always compare against the original full scan,
+/// including entries omitted by --only-entry or an incremental patch request.
+fn patchable_entries(
+    source: &PeFile,
+    selected: &[VmEntry],
+    vm_section: &str,
+) -> (Vec<VmEntry>, Vec<(u64, String)>) {
+    let all_entries = discover::find_vm_entries(source, vm_section);
+    let functions = source.function_table();
+    let mut accepted = Vec::new();
+    let mut rejected = Vec::new();
+    for entry in selected {
+        let start = entry.trampoline_va;
+        let reason = (|| {
+            let Some(end) = start.checked_add(5) else {
+                return Some("redirect address overflows".to_string());
+            };
+            let Some(rva) = source.va_to_rva(start) else {
+                return Some("redirect is outside the image".to_string());
+            };
+            let Some(section) = source.section_for_rva(rva) else {
+                return Some("redirect has no containing section".to_string());
+            };
+            let offset = (rva - section.virtual_address) as u64;
+            if !section.is_executable()
+                || offset + 5 > section.raw_size as u64
+                || source.read_va(start, 5).is_none_or(|b| b.len() != 5)
+            {
+                return Some("redirect needs five file-backed executable bytes".to_string());
+            }
+            if let Some(other) = all_entries.iter().find(|other| {
+                other.trampoline_va != start && other.trampoline_va.abs_diff(start) < 5
+            }) {
+                return Some(format!(
+                    "five-byte redirect overlaps entry {:#x}",
+                    other.trampoline_va
+                ));
+            }
+            if let Some(&(begin, stop)) = functions.iter().find(|&&(begin, stop)| {
+                (start < begin && begin < end) || (begin <= start && start < stop && stop < end)
+            }) {
+                return Some(format!(
+                    "five-byte redirect crosses runtime function boundary {begin:#x}..{stop:#x}"
+                ));
+            }
+            None
+        })();
+        if let Some(reason) = reason {
+            rejected.push((start, reason));
+        } else {
+            accepted.push(*entry);
+        }
+    }
+    (accepted, rejected)
+}
+
 /// Emit all devirtualizable functions and write a patched copy of the PE.
 pub fn write_devirt(
     pe: &PeFile,
+    patch_base: Option<&PeFile>,
     entries: &[VmEntry],
     steps: usize,
+    max_blocks: usize,
     timeout_secs: u64,
     vm_section: &str,
     jobs: usize,
 ) -> Result<(Vec<u8>, DevirtReport)> {
-    // recover, schedule, and allocate all functions.
+    if let Some(base) = patch_base {
+        validate_patch_base(pe, base, vm_section)?;
+    }
+    // Exclude unsafe redirects before recovery and layout. In particular, a
+    // rejected entry must never enter CallRedirects even if its CFG is complete.
+    let (entries, patch_failures) = patchable_entries(pe, entries, vm_section);
+    for (entry, reason) in &patch_failures {
+        eprintln!("  patch {entry:#x}: rejected ({reason})");
+    }
+    // Recover all functions; schedule and allocate only graphs that pass the
+    // complete-recovery and CFG-invariant gates.
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(jobs)
@@ -125,7 +196,7 @@ pub fn write_devirt(
             .par_iter()
             .map(|e| {
                 let started = std::time::Instant::now();
-                let prepared = prepare_one(pe, e, steps, timeout_secs, vm_section);
+                let prepared = prepare_one(pe, e, steps, max_blocks, timeout_secs, vm_section);
                 let elapsed = started.elapsed();
                 let n = recovered.fetch_add(1, Ordering::Relaxed) + 1;
                 let blocks = prepared.cfg.blocks.len();
@@ -154,6 +225,11 @@ pub fn write_devirt(
     );
     eprintln!("planning output layout for {ready} functions…");
 
+    // Recovery and code generation always inspect the original image. Only
+    // layout, metadata preservation, and byte writes use the derived base.
+    let source_pe = pe;
+    let pe = patch_base.unwrap_or(pe);
+
     let fa = pe.file_alignment as usize;
     let sa = pe.section_alignment as usize;
     let last = pe.sections.last().context("no sections")?;
@@ -178,9 +254,9 @@ pub fn write_devirt(
                 continue;
             }
             let real_va = devirt_base_va + probe as u64;
-            let Ok(out) =
-                codegen::emit_function_full(&p.cfg, &p.blocks, &p.allocs, real_va, pe, &redirect)
-            else {
+            let Ok(out) = codegen::emit_function_full(
+                &p.cfg, &p.blocks, &p.allocs, real_va, source_pe, &redirect,
+            ) else {
                 continue;
             };
             redirect.insert(p.entry_va, real_va);
@@ -190,7 +266,7 @@ pub fn write_devirt(
     let mut report = DevirtReport {
         retargeted: 0,
         incomplete: Vec::new(),
-        failed: Vec::new(),
+        failed: patch_failures,
         dropped_signature: false,
         pdata_entries: 0,
         pdata_added: 0,
@@ -208,21 +284,21 @@ pub fn write_devirt(
 
         emit_done += 1;
         let real_va = devirt_base_va + cursor as u64;
-        let out =
-            match codegen::emit_function_full(&p.cfg, &p.blocks, &p.allocs, real_va, pe, &redirect)
-            {
-                Ok(out) => out,
-                Err(e) => {
-                    eprintln!(
-                        "  emit   [{emit_done:>width$}/{ready}] {:#x}: failed ({e})",
-                        p.entry_va,
-                    );
-                    report.failed.push((p.entry_va, e.to_string()));
-                    offsets.push(None);
-                    emitted.push(Vec::new());
-                    continue;
-                }
-            };
+        let out = match codegen::emit_function_full(
+            &p.cfg, &p.blocks, &p.allocs, real_va, source_pe, &redirect,
+        ) {
+            Ok(out) => out,
+            Err(e) => {
+                eprintln!(
+                    "  emit   [{emit_done:>width$}/{ready}] {:#x}: failed ({e})",
+                    p.entry_va,
+                );
+                report.failed.push((p.entry_va, e.to_string()));
+                offsets.push(None);
+                emitted.push(Vec::new());
+                continue;
+            }
+        };
 
         let unwind_blob = codegen::unwind_info(&out.prologue);
         unwind.push((cursor, unwind_blob));
@@ -406,6 +482,47 @@ pub fn write_devirt(
     Ok((out, report))
 }
 
+fn validate_patch_base(source: &PeFile, base: &PeFile, vm_section: &str) -> Result<()> {
+    if source.image_base != base.image_base
+        || source.entry_point_rva != base.entry_point_rva
+        || source.file_alignment != base.file_alignment
+        || source.section_alignment != base.section_alignment
+        || source.sections.len() != base.sections.len()
+        || source.loader_bound != base.loader_bound
+    {
+        bail!("patch base has an incompatible image layout");
+    }
+    for (i, (a, b)) in source.sections.iter().zip(&base.sections).enumerate() {
+        let last = i + 1 == source.sections.len();
+        if a.name != b.name
+            || a.virtual_address != b.virtual_address
+            || a.raw_address != b.raw_address
+            || (!last && (a.virtual_size != b.virtual_size || a.raw_size != b.raw_size))
+            || b.virtual_size < a.virtual_size
+            || b.raw_size < a.raw_size
+        {
+            bail!("patch base section {} is incompatible", a.name);
+        }
+    }
+    let a = source
+        .section_by_name(vm_section)
+        .context("source VM section absent")?;
+    let b = base
+        .section_by_name(vm_section)
+        .context("base VM section absent")?;
+    let original_vm = source.section_bytes(a);
+    if base.section_bytes(b).get(..original_vm.len()) != Some(original_vm) {
+        bail!("patch base VM bytes differ from the original input");
+    }
+    let old = read_exception_directory(source);
+    let preserved: std::collections::HashSet<_> =
+        read_exception_directory(base).into_iter().collect();
+    if !old.iter().all(|r| preserved.contains(r)) {
+        bail!("patch base does not preserve the original runtime function table");
+    }
+    Ok(())
+}
+
 /// Recover + schedule + allocate one function, returning reusable parts.
 struct PreparedFn {
     entry_va: u64,
@@ -419,22 +536,38 @@ fn prepare_one(
     pe: &PeFile,
     entry: &VmEntry,
     steps: usize,
+    max_blocks: usize,
     timeout_secs: u64,
     vm_section: &str,
 ) -> PreparedFn {
     let mut ex = explore::Explorer::with_vm_section(pe, crate::vm::DEFAULT_STACK_BASE, vm_section);
     ex.step_budget = steps;
+    ex.block_budget = max_blocks;
     ex.time_budget = std::time::Duration::from_secs(timeout_secs);
 
     let cfg = ex.recover(entry.vm_entry_va);
+    prepare_recovered(entry.trampoline_va, cfg)
+}
+
+fn prepare_recovered(entry_va: u64, cfg: ir::Cfg) -> PreparedFn {
+    // A rejected graph will never reach emission. Keep its diagnostic and
+    // recovery statistics, but avoid building and allocating potentially huge
+    // schedules for it (and never ask scheduling to interpret invalid SSA).
+    if let Some(reason) = why_incomplete(&cfg) {
+        return PreparedFn {
+            entry_va,
+            incomplete: Some(reason),
+            cfg,
+            blocks: Vec::new(),
+            allocs: Vec::new(),
+        };
+    }
     let blocks = sched::schedule(&cfg);
-    let entry_va = entry.trampoline_va;
-    let incomplete = why_incomplete(&cfg);
     let allocs: Vec<regalloc::Alloc> = blocks.iter().map(regalloc::allocate).collect();
 
     PreparedFn {
         entry_va,
-        incomplete,
+        incomplete: None,
         cfg,
         blocks,
         allocs,
@@ -465,4 +598,238 @@ fn align_up_u32(v: u32, align: u32) -> u32 {
 
 fn write_u32_at(buf: &mut Vec<u8>, off: usize, val: u32) {
     buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
+}
+
+#[cfg(test)]
+mod preparation_tests {
+    use super::*;
+    use crate::ir::expr::{Arena, BlockRef, Reg};
+    use crate::ir::{Block, BlockId, Terminator};
+
+    fn graph() -> ir::Cfg {
+        let id = BlockId {
+            handler: 0x1000,
+            vip: None,
+        };
+        ir::Cfg {
+            entry: id,
+            arena: Arena::default(),
+            blocks: vec![Block {
+                id,
+                block_ref: BlockRef(0),
+                params: vec![],
+                events: vec![],
+                from_vm_context: false,
+                exit_regs: vec![],
+                terminator: Terminator::TailCall { target: 0x2000 },
+                cost: 17,
+                preds: vec![],
+            }],
+            total_steps: 17,
+            timed_out: false,
+            unresolved: 0,
+            back_edges: vec![],
+            trivial_phis_removed: 0,
+            stack_base: crate::vm::DEFAULT_STACK_BASE,
+            vm_range: (0, 0),
+        }
+    }
+
+    #[test]
+    fn incomplete_graph_keeps_reason_without_scheduling_invalid_expressions() {
+        let mut cfg = graph();
+        cfg.unresolved = 1;
+        // Scheduling this foreign reference would index outside cfg.arena.
+        // An already-rejected graph's expression roots must never be visited.
+        let foreign = Arena::default().init_reg(Reg::Rax);
+        cfg.blocks[0].exit_regs.push((Reg::Rax, foreign));
+        let prepared = prepare_recovered(0x1000, cfg);
+        assert_eq!(
+            prepared.incomplete.as_deref(),
+            Some("1 block(s) never resolved")
+        );
+        assert_eq!(prepared.cfg.total_steps, 17);
+        assert!(prepared.blocks.is_empty());
+        assert!(prepared.allocs.is_empty());
+    }
+
+    #[test]
+    fn invariant_rejection_does_not_create_schedules_or_allocations() {
+        let mut cfg = graph();
+        cfg.blocks[0].terminator = Terminator::Jump(BlockId {
+            handler: 0x3000,
+            vip: None,
+        });
+        let expected = why_incomplete(&cfg).expect("a dangling CFG edge must be rejected");
+        let prepared = prepare_recovered(0x1000, cfg);
+        assert_eq!(prepared.incomplete.as_deref(), Some(expected.as_str()));
+        assert!(prepared.blocks.is_empty());
+        assert!(prepared.allocs.is_empty());
+    }
+
+    #[test]
+    fn complete_graph_is_still_scheduled_and_allocated() {
+        let prepared = prepare_recovered(0x1000, graph());
+        assert!(prepared.incomplete.is_none());
+        assert_eq!(prepared.blocks.len(), 1);
+        assert_eq!(prepared.allocs.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod patch_boundary_tests {
+    use super::*;
+    use crate::binary::pe::Section;
+    use iced_x86::{Decoder, DecoderOptions, FlowControl};
+
+    const BASE: u64 = 0x180000000;
+    const TEXT: u64 = BASE + 0x1000;
+    const VM: u64 = BASE + 0x3000;
+
+    fn fixture() -> PeFile {
+        let mut data = vec![0; 0x800];
+        data[0x200..0x300].fill(0xcc);
+        data[0x200] = 0xe9;
+        write_u32_at(&mut data, 0x201, (VM - TEXT - 5) as u32);
+        // The real function calls the short swallowed alias and returns. The
+        // alias must retain its original target if it is rejected for patching.
+        data[0x600] = 0xe8;
+        write_u32_at(
+            &mut data,
+            0x601,
+            ((TEXT + 5) as i64 - (VM + 5) as i64) as u32,
+        );
+        data[0x605] = 0xc3;
+        let records = [
+            (0x1000, 0x1005),
+            (0x1005, 0x1007),
+            (0x1007, 0x1020),
+            (0x1020, 0x1028),
+        ];
+        for (i, (begin, end)) in records.into_iter().enumerate() {
+            let at = 0x400 + i * fmt::RUNTIME_FUNCTION_SIZE;
+            write_u32_at(&mut data, at, begin);
+            write_u32_at(&mut data, at + 4, end);
+            write_u32_at(&mut data, at + 8, 0x2080);
+        }
+        data[0x480] = 1; // version 1, empty UNWIND_INFO
+        let dir = fmt::data_directory_offset(0x18, fmt::IMAGE_DIRECTORY_ENTRY_EXCEPTION);
+        write_u32_at(&mut data, dir, 0x2000);
+        write_u32_at(
+            &mut data,
+            dir + 4,
+            (records.len() * fmt::RUNTIME_FUNCTION_SIZE) as u32,
+        );
+        PeFile {
+            data,
+            image_base: BASE,
+            entry_point_rva: 0x1000,
+            size_of_image: 0x4000,
+            sections: vec![
+                Section {
+                    name: ".text".into(),
+                    virtual_address: 0x1000,
+                    virtual_size: 0x100,
+                    raw_address: 0x200,
+                    raw_size: 0x100,
+                    characteristics: fmt::IMAGE_SCN_MEM_EXECUTE | fmt::IMAGE_SCN_MEM_READ,
+                },
+                Section {
+                    name: ".pdata".into(),
+                    virtual_address: 0x2000,
+                    virtual_size: 0x100,
+                    raw_address: 0x400,
+                    raw_size: 0x100,
+                    characteristics: fmt::IMAGE_SCN_MEM_READ,
+                },
+                Section {
+                    name: ".tvm0".into(),
+                    virtual_address: 0x3000,
+                    virtual_size: 0x100,
+                    raw_address: 0x600,
+                    raw_size: 0x100,
+                    characteristics: fmt::IMAGE_SCN_MEM_EXECUTE | fmt::IMAGE_SCN_MEM_READ,
+                },
+            ],
+            opt_header_offset: 0x18,
+            section_table_offset: 0x180,
+            file_alignment: 0x200,
+            section_alignment: 0x1000,
+            size_of_headers: 0x200,
+            loader_bound: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn selected_alias_is_checked_against_unselected_original_entries() {
+        let pe = fixture();
+        let all = discover::find_vm_entries(&pe, ".tvm0");
+        assert_eq!(
+            all.iter().map(|e| e.trampoline_va).collect::<Vec<_>>(),
+            vec![TEXT, TEXT + 5, TEXT + 7, TEXT + 0x20]
+        );
+        for selected in [all[1], all[2]] {
+            let (accepted, rejected) = patchable_entries(&pe, &[selected], ".tvm0");
+            assert!(accepted.is_empty());
+            assert_eq!(rejected.len(), 1);
+            assert!(rejected[0].1.contains("overlaps entry"));
+        }
+        let (accepted, rejected) = patchable_entries(&pe, &[all[0], all[3]], ".tvm0");
+        assert_eq!(accepted.len(), 2);
+        assert!(rejected.is_empty());
+    }
+
+    #[test]
+    fn short_runtime_function_and_raw_section_end_are_rejected() {
+        let mut pe = fixture();
+        // Remove the +7 alias, leaving the short +5 function with no nearby
+        // discovered entry. Its own .pdata end still forbids a five-byte patch.
+        let dir =
+            fmt::data_directory_offset(pe.opt_header_offset, fmt::IMAGE_DIRECTORY_ENTRY_EXCEPTION);
+        write_u32_at(&mut pe.data, dir + 4, 2 * fmt::RUNTIME_FUNCTION_SIZE as u32);
+        pe.data[0x418..0x430].fill(0);
+        let all = discover::find_vm_entries(&pe, ".tvm0");
+        let (accepted, rejected) = patchable_entries(&pe, &[all[1]], ".tvm0");
+        assert!(accepted.is_empty());
+        assert!(rejected[0].1.contains("runtime function boundary"));
+        let beyond = VmEntry {
+            trampoline_va: TEXT + 0xfc,
+            vm_entry_va: VM,
+            int3_padding: 0,
+        };
+        let (accepted, rejected) = patchable_entries(&pe, &[beyond], ".tvm0");
+        assert!(accepted.is_empty());
+        assert!(rejected[0].1.contains("five file-backed executable bytes"));
+    }
+
+    #[test]
+    fn rejected_aliases_are_not_written_or_used_as_call_redirects() {
+        let pe = fixture();
+        let all = discover::find_vm_entries(&pe, ".tvm0");
+        let (out, report) = write_devirt(&pe, None, &all[..3], 100, 8, 5, ".tvm0", 1).unwrap();
+        assert_eq!(report.total(), 3);
+        assert_eq!(report.retargeted, 1);
+        assert_eq!(report.failed.len(), 2);
+        assert_eq!(report.pdata_added, 1);
+        assert_eq!(&out[0x205..0x300], &pe.data[0x205..0x300]);
+        let rel = i32::from_le_bytes(out[0x201..0x205].try_into().unwrap());
+        let body_va = TEXT.wrapping_add(5).wrapping_add_signed(rel as i64);
+        let body_off = 0x600 + (body_va - VM) as usize;
+        let decoder = Decoder::with_ip(
+            64,
+            &out[body_off..body_off + 128],
+            body_va,
+            DecoderOptions::NONE,
+        );
+        let calls: Vec<_> = decoder
+            .into_iter()
+            .filter(|i| i.flow_control() == FlowControl::Call)
+            .map(|i| i.near_branch_target())
+            .collect();
+        assert_eq!(
+            calls,
+            vec![TEXT + 5],
+            "a rejected alias must retain its source address"
+        );
+    }
 }

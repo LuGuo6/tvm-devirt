@@ -68,6 +68,8 @@ pub struct BoxedMemOp {
 /// One scheduled operation, in three-address form.
 #[derive(Debug, Clone)]
 pub enum Instr {
+    /// Ordered stack-page reads; never dead-code eliminated.
+    StackProbe { top: Operand, size: Operand },
     /// `dst = a op b`
     /// `width` is the width of the *result*. For a comparison that is `W8`, because
     /// the result is a boolean, so it does not describe what the comparison measures.
@@ -173,6 +175,14 @@ pub enum CallTarget {
 }
 
 /// A block lowered to a linear instruction sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndirectTailKind {
+    /// `control` is the already-loaded target value.
+    Register,
+    /// `control + displacement` is read by the final JMP, exactly once.
+    Memory { displacement: i32 },
+}
+
 #[derive(Debug, Clone)]
 pub struct SchedBlock {
     pub id: crate::ir::BlockId,
@@ -183,7 +193,10 @@ pub struct SchedBlock {
     /// Registers left holding whatever a callee returned. The emitted `call` already
     /// establishes these, so they carry no instructions.
     pub callee_set: Vec<Reg>,
-    /// The branch predicate or switch selector, once scheduled.
+    pub indirect_tail: Option<IndirectTailKind>,
+    /// The branch predicate or switch selector, once scheduled. For a supported
+    /// IndirectTailCall this is the address of its terminal 64-bit load: the load
+    /// itself executes exactly once in the final JMP memory operand.
     pub control: Option<Operand>,
     /// A comparison folded into the terminator's conditional jump. When `control` is produced by a single `Eq`/`Ult`/`Slt` that nothing else reads, the branch can test the operands directly and the comparison never needs to become a value.
     pub fused_cmp: Option<FusedCmp>,
@@ -446,6 +459,7 @@ fn successors_of(t: &crate::ir::Terminator) -> Vec<crate::ir::BlockId> {
         }
         Terminator::Return { .. }
         | Terminator::TailCall { .. }
+        | Terminator::IndirectTailCall { .. }
         | Terminator::Unresolved { .. }
         | Terminator::AdoptedReturn => Vec::new(),
     }
@@ -532,6 +546,7 @@ fn thread_empty_jumps(blocks: &mut [SchedBlock]) {
             }
             Terminator::Return { .. }
             | Terminator::TailCall { .. }
+            | Terminator::IndirectTailCall { .. }
             | Terminator::Unresolved { .. }
             | Terminator::AdoptedReturn => {}
         }
@@ -597,7 +612,7 @@ fn narrow_partially_dead_stores(b: &mut SchedBlock) -> usize {
             }
             // Any store we cannot resolve to a frame byte, and any call or boxed
             // instruction, may read or alias anything.
-            Instr::Store { .. } | Instr::Load { .. } | Instr::Call { .. } | Instr::Boxed { .. } => {
+            Instr::Store { .. } | Instr::Load { .. } | Instr::Call { .. } | Instr::Boxed { .. } | Instr::StackProbe { .. } => {
                 freeze(&mut last, &mut survives, None);
             }
             _ => {}
@@ -689,6 +704,7 @@ fn merge_identical_returns(blocks: &mut [SchedBlock]) {
             }
             Terminator::Return { .. }
             | Terminator::TailCall { .. }
+            | Terminator::IndirectTailCall { .. }
             | Terminator::Unresolved { .. }
             | Terminator::AdoptedReturn => {}
         }
@@ -804,6 +820,7 @@ fn entry_read_widths(
                     note(x, 64);
                 }
             }
+            Instr::StackProbe { top, size } => { note(top, 64); note(size, 64); }
             Instr::Opaque { .. } => {}
         }
     }
@@ -1041,8 +1058,96 @@ fn prune_dead_exits(cfg: &Cfg, blocks: &mut [SchedBlock]) {
     }
 }
 
+/// Only sink a final, unshared guest load into an indirect tail JMP. Keeping its
+/// address live is sufficient; scheduling the value would read the vtable slot
+/// once here and again after frame teardown. A load with another semantic user
+/// or a later effect is deliberately left unsupported instead of being moved.
+fn terminal_tail_load(cfg: &Cfg, b: &Block) -> Option<(Ref, Ref)> {
+    let Terminator::IndirectTailCall { target } = b.terminator else {
+        return None;
+    };
+    let Op::Load(addr, _) = *cfg.arena.op(target) else {
+        return None;
+    };
+    if cfg.arena.width(target) != Width::W64 || cfg.arena.width(addr) != Width::W64 {
+        return None;
+    }
+    let uses_target = |root: Ref| {
+        let mut todo = vec![root];
+        let mut seen = HashSet::new();
+        while let Some(r) = todo.pop() {
+            if r == target {
+                return true;
+            }
+            if seen.insert(r) {
+                todo.extend(cfg.arena.children(r));
+            }
+        }
+        false
+    };
+    if b.exit_regs.iter().any(|(_, v)| uses_target(*v)) {
+        return None;
+    }
+    let mut found = false;
+    for event in &b.events {
+        match event {
+            Event::Store { region, .. } | Event::Load { region, .. } if !region.is_guest() => {
+                continue;
+            }
+            Event::Load { value, width, .. } if *value == target && *width == Width::W64 => {
+                if found {
+                    return None;
+                }
+                found = true;
+                continue;
+            }
+            _ => {}
+        }
+        if found {
+            return None;
+        }
+        let mut roots = Vec::new();
+        event.append_roots(&mut roots);
+        if roots.into_iter().any(uses_target) {
+            return None;
+        }
+    }
+    // The explicit load event proves its position relative to other effects.
+    found.then_some((target, addr))
+}
+
 fn schedule_block(cfg: &Cfg, b: &Block) -> SchedBlock {
     let mut s = Scheduler::new(&cfg.arena, b.block_ref, cfg.stack_base);
+    let tail_load = terminal_tail_load(cfg, b);
+    let tail_register = match b.terminator {
+        Terminator::IndirectTailCall { target }
+            if cfg.arena.width(target) == Width::W64
+                && b.exit_regs.iter().any(|(reg, value)| {
+                    crate::ir::regalloc::VOLATILE.contains(reg) && *value == target
+                }) =>
+        {
+            Some(target)
+        }
+        _ => None,
+    };
+    let tail_memory = tail_load.map(|(_, addr)| {
+        // Keep base+constant in the JMP memory operand when the base already has
+        // a proven exit register. This never invents a scratch register.
+        if !b.exit_regs.iter().any(|(_, value)| *value == addr) {
+            if let Op::Bin(BinOp::Add, a, c) = *cfg.arena.op(addr) {
+                for (base, constant) in [(a, c), (c, a)] {
+                    if let Some(n) = cfg.arena.as_const(constant) {
+                        if let Ok(disp) = i32::try_from(n as i64) {
+                            if b.exit_regs.iter().any(|(_, value)| *value == base) {
+                                return (base, disp);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        (addr, 0)
+    });
 
     // Instruction index and guest RSP of each call, for `retarget_stack_args`.
     let mut call_rsp: Vec<(usize, Option<u64>)> = Vec::new();
@@ -1052,6 +1157,10 @@ fn schedule_block(cfg: &Cfg, b: &Block) -> SchedBlock {
     // emitting the effect first means the register reuses that value rather than
     // scheduling a second, identical load.
     for e in &b.events {
+        if matches!(e, Event::Load { value, .. } if tail_load.is_some_and(|(target, _)| target == *value))
+        {
+            continue;
+        }
         match e {
             // Only guest-visible effects are emitted. The rest is interpreter
             // bookkeeping and has no place in devirtualized output.
@@ -1083,6 +1192,11 @@ fn schedule_block(cfg: &Cfg, b: &Block) -> SchedBlock {
                 // it shared with any later use.
                 let _ = s.value(*value);
                 let _ = (addr, width);
+            }
+            Event::StackProbe { top, size, .. } => {
+                let top = s.value(*top);
+                let size = s.value(*size);
+                s.instrs.push(Instr::StackProbe { top, size });
             }
             Event::Call {
                 target,
@@ -1192,16 +1306,22 @@ fn schedule_block(cfg: &Cfg, b: &Block) -> SchedBlock {
     let control = match &b.terminator {
         Terminator::Branch { predicate, .. } => Some(s.value(*predicate)),
         Terminator::Switch { selector, .. } => Some(s.value(*selector)),
+        Terminator::IndirectTailCall { .. } => tail_register
+            .map(|target| s.value(target))
+            .or_else(|| tail_memory.map(|(addr, _)| s.value(addr))),
         // A `ret` reads the return address off the stack itself, so the recovered destination needs no register and no instructions. Scheduling it would make it a DCE root and keep alive a load of the return slot whose result nothing can use.
         Terminator::Return { .. } => None,
         _ => None,
     };
 
-    // A register still holding a `call_ret` opaque needs no code: that opaque was minted by `clobber_call` to stand for "whatever the callee left here", and the `call` instruction emitted above already establishes exactly that.
+    // Only an undefined ABI-clobbered value needs no exit move. A call_ret is a
+    // concrete value produced in RAX, which later instructions can overwrite or
+    // copy to another guest register (for example RCX for a virtual tail call).
+    // Keep it live and let boundary reconciliation place it in every exit home.
     let mut exits = Vec::new();
     let mut callee_set = Vec::new();
     for (reg, v) in &b.exit_regs {
-        if matches!(cfg.arena.op(*v), Op::Opaque("call_ret" | "clobbered", _)) {
+        if matches!(cfg.arena.op(*v), Op::Opaque("clobbered", _)) {
             callee_set.push(*reg);
         } else {
             exits.push((*reg, s.value(*v)));
@@ -1213,6 +1333,11 @@ fn schedule_block(cfg: &Cfg, b: &Block) -> SchedBlock {
         instrs: s.instrs,
         exits,
         callee_set,
+        indirect_tail: if tail_register.is_some() {
+            Some(IndirectTailKind::Register)
+        } else {
+            tail_memory.map(|(_, displacement)| IndirectTailKind::Memory { displacement })
+        },
         control,
         fused_cmp: None,
         terminator: b.terminator.clone(),
@@ -1386,6 +1511,7 @@ fn each_operand(i: &Instr, f: &mut impl FnMut(&Operand)) {
                 f(a);
             }
         }
+        Instr::StackProbe { top, size } => { f(top); f(size); }
         Instr::Opaque { .. } => {}
     }
 }
@@ -1426,12 +1552,17 @@ fn each_operand_mut(i: &mut Instr, f: &mut impl FnMut(&mut Operand)) {
                 f(a);
             }
         }
+        Instr::StackProbe { top, size } => { f(top); f(size); }
         Instr::Opaque { .. } => {}
     }
 }
 
 /// The comparison defining `control`, if the branch can absorb it. Requires the value to be defined by exactly one `Eq`/`Ult`/`Slt` and read by nothing except `control`.
 fn fusable_cmp(b: &SchedBlock) -> Option<(usize, FusedCmp)> {
+    // An indirect target is a memory address, never a Boolean branch predicate.
+    if matches!(b.terminator, Terminator::IndirectTailCall { .. }) {
+        return None;
+    }
     let Some(Operand::Val(cv)) = &b.control else {
         return None;
     };
@@ -1515,6 +1646,7 @@ pub fn frame_extent(b: &SchedBlock) -> Option<(i64, i64)> {
                     note(a);
                 }
             }
+            Instr::StackProbe { top, size } => { note(top); note(size); }
             _ => {}
         }
     }
@@ -1757,6 +1889,7 @@ pub fn analyze_frame_escapes(blocks: &[SchedBlock]) -> FrameEscapes {
                     leak(a);
                     leak(rhs);
                 }
+                Instr::StackProbe { top, size } => { leak(top); leak(size); }
                 Instr::Opaque { .. } => {}
             }
         }
@@ -1990,6 +2123,11 @@ pub fn eliminate_dead_with(b: &mut SchedBlock, escapes: &FrameEscapes) -> usize 
                     _ => true,
                 }
             }
+            Instr::StackProbe { .. } => {
+                overwritten.clear();
+                overwritten_frame.clear();
+                true
+            }
             Instr::Call { .. } | Instr::Boxed { .. } => {
                 overwritten.clear();
                 overwritten_frame.retain(|key| !escapes.may_escape(*key));
@@ -2061,6 +2199,7 @@ pub fn eliminate_dead_with(b: &mut SchedBlock, escapes: &FrameEscapes) -> usize 
                     note(a);
                 }
             }
+            Instr::StackProbe { top, size } => { note(top); note(size); }
             Instr::Opaque { .. } => {}
         }
     }
@@ -2232,6 +2371,7 @@ fn render_instr(i: &Instr) -> String {
                 o(*value)
             )
         }
+        Instr::StackProbe { top, size } => format!("stack_probe top={}, size={}", o(*top), o(*size)),
         Instr::Call { target, args } => {
             let t = match target {
                 CallTarget::Direct(a) => format!("call {a:#x}"),
@@ -2295,6 +2435,187 @@ mod tests {
 
     const STACK_BASE: u64 = DEFAULT_STACK_BASE;
 
+    #[test]
+    fn stack_probe_keeps_symbolic_size_live_and_stays_between_effects() {
+        let mut cfg = indirect_tail_fixture();
+        let top = cfg.arena.constant(STACK_BASE - 0x218, Width::W64);
+        let address = cfg.arena.init_reg(Reg::Rdx);
+        let size = cfg.arena.load(address, Width::W64);
+        let one = cfg.arena.constant(1, Width::W64);
+        let two = cfg.arena.constant(2, Width::W64);
+        cfg.blocks[0].events = vec![
+            Event::Store { addr: address, value: one, width: Width::W64, site: 0x1000, region: Region::Guest },
+            Event::StackProbe { top, size, site: 0x1003 },
+            Event::Store { addr: address, value: two, width: Width::W64, site: 0x1008, region: Region::Guest },
+        ];
+        cfg.blocks[0].exit_regs.clear();
+        cfg.blocks[0].terminator = Terminator::Return { dest: one };
+        let scheduled = schedule(&cfg);
+        let b = &scheduled[0];
+        let probe = b.instrs.iter().position(|i| matches!(i, Instr::StackProbe { .. })).unwrap();
+        assert!(matches!(b.instrs[probe], Instr::StackProbe { top: Operand::Frame(-0x218), size: Operand::Val(_) }));
+        assert!(b.instrs[..probe].iter().any(|i| matches!(i, Instr::Store { .. })));
+        assert!(b.instrs[probe + 1..].iter().any(|i| matches!(i, Instr::Store { .. })));
+        let alloc = crate::ir::regalloc::allocate(b);
+        assert!(crate::ir::regalloc::verify(b, &alloc).is_empty());
+    }
+
+    fn indirect_tail_fixture() -> Cfg {
+        let mut arena = Arena::new();
+        let object = arena.init_reg(Reg::Rcx);
+        let table = arena.load(object, Width::W64);
+        let target = arena.load(table, Width::W64);
+        let id = bid(0x1000);
+        Cfg {
+            entry: id,
+            arena,
+            blocks: vec![Block {
+                id,
+                block_ref: BlockRef(0),
+                params: vec![],
+                events: vec![
+                    Event::Load {
+                        addr: object,
+                        value: table,
+                        width: Width::W64,
+                        site: 0x1000,
+                        region: Region::Guest,
+                    },
+                    Event::Load {
+                        addr: table,
+                        value: target,
+                        width: Width::W64,
+                        site: 0x1003,
+                        region: Region::Guest,
+                    },
+                ],
+                from_vm_context: false,
+                exit_regs: vec![(Reg::Rax, table), (Reg::Rcx, object)],
+                terminator: Terminator::IndirectTailCall { target },
+                cost: 2,
+                preds: vec![],
+            }],
+            total_steps: 2,
+            unresolved: 0,
+            back_edges: vec![],
+            trivial_phis_removed: 0,
+            timed_out: false,
+            stack_base: STACK_BASE,
+            vm_range: (0, 0),
+        }
+    }
+
+    #[test]
+    fn indirect_tail_load_executes_only_in_the_terminal_jump() {
+        let cfg = indirect_tail_fixture();
+        let scheduled = schedule(&cfg);
+        assert_eq!(scheduled.len(), 1);
+        let b = &scheduled[0];
+        assert_eq!(
+            b.instrs
+                .iter()
+                .filter(|i| matches!(i, Instr::Load { .. }))
+                .count(),
+            1
+        );
+        assert!(b.fused_cmp.is_none());
+        let address = b.control.expect("terminal load address");
+        assert!(b.exits.contains(&(Reg::Rax, address)));
+        let Operand::Val(value) = address else {
+            panic!("table load must have a value")
+        };
+        let ranges = crate::ir::regalloc::ranges(b);
+        assert!(
+            ranges
+                .iter()
+                .any(|r| r.item == crate::ir::regalloc::Item::Val(value)
+                    && r.last_use == b.instrs.len() + 1)
+        );
+    }
+
+    #[test]
+    fn indirect_tail_register_target_retains_the_single_prior_load() {
+        let mut cfg = indirect_tail_fixture();
+        let Terminator::IndirectTailCall { target } = cfg.blocks[0].terminator else {
+            unreachable!()
+        };
+        cfg.blocks[0].exit_regs.push((Reg::Rdx, target));
+        let scheduled = schedule(&cfg);
+        let b = &scheduled[0];
+        assert_eq!(b.indirect_tail, Some(IndirectTailKind::Register));
+        assert_eq!(
+            b.instrs
+                .iter()
+                .filter(|i| matches!(i, Instr::Load { .. }))
+                .count(),
+            2
+        );
+        assert!(b.exits.contains(&(Reg::Rdx, b.control.unwrap())));
+    }
+
+    #[test]
+    fn indirect_tail_memory_slot_displacement_is_not_a_second_load() {
+        let mut cfg = indirect_tail_fixture();
+        let table = cfg.blocks[0].exit_regs[0].1;
+        let offset = cfg.arena.constant(0x20, Width::W64);
+        let addr = cfg.arena.bin(BinOp::Add, table, offset);
+        let target = cfg.arena.load(addr, Width::W64);
+        cfg.blocks[0].events[1] = Event::Load {
+            addr,
+            value: target,
+            width: Width::W64,
+            site: 0x1003,
+            region: Region::Guest,
+        };
+        cfg.blocks[0].terminator = Terminator::IndirectTailCall { target };
+        let scheduled = schedule(&cfg);
+        let b = &scheduled[0];
+        assert_eq!(
+            b.indirect_tail,
+            Some(IndirectTailKind::Memory { displacement: 0x20 })
+        );
+        assert_eq!(
+            b.instrs
+                .iter()
+                .filter(|i| matches!(i, Instr::Load { .. }))
+                .count(),
+            1
+        );
+        assert!(b.exits.contains(&(Reg::Rax, b.control.unwrap())));
+    }
+
+    #[test]
+    fn indirect_tail_load_is_not_sunk_past_effects_or_other_users() {
+        for mode in 0..4 {
+            let mut cfg = indirect_tail_fixture();
+            let Terminator::IndirectTailCall { target } = cfg.blocks[0].terminator else {
+                unreachable!()
+            };
+            match mode {
+                0 => cfg.blocks[0].exit_regs.push((Reg::Rbx, target)),
+                1 => {
+                    let one = cfg.arena.constant(1, Width::W64);
+                    let addr = cfg.arena.init_reg(Reg::Rdx);
+                    cfg.blocks[0].events.push(Event::Store {
+                        addr,
+                        value: one,
+                        width: Width::W64,
+                        site: 0x1006,
+                        region: Region::Guest,
+                    });
+                }
+                2 => {
+                    cfg.blocks[0].events.pop();
+                }
+                _ => {
+                    let duplicate = cfg.blocks[0].events.last().unwrap().clone();
+                    cfg.blocks[0].events.push(duplicate);
+                }
+            }
+            assert!(schedule(&cfg)[0].control.is_none(), "mode {mode}");
+        }
+    }
+
     /// An immediate store to a frame slot, for the narrowing tests.
     fn fstore(a: i64, v: u64, w: Width) -> Instr {
         Instr::Store {
@@ -2318,6 +2639,7 @@ mod tests {
             instrs: Vec::new(),
             exits,
             callee_set: Vec::new(),
+            indirect_tail: None,
             control: None,
             terminator: t,
             fused_cmp: None,
@@ -3196,6 +3518,7 @@ mod tests {
                     return_exits.clone()
                 },
                 callee_set: Vec::new(),
+                indirect_tail: None,
                 control: None,
                 terminator: b.terminator.clone(),
                 fused_cmp: None,
@@ -3274,6 +3597,7 @@ mod tests {
                     (Reg::Rdi, Operand::Entry(Reg::Rdi)),
                 ],
                 callee_set: Vec::new(),
+                indirect_tail: None,
                 control: None,
                 terminator: b.terminator.clone(),
                 fused_cmp: None,
@@ -3366,6 +3690,7 @@ mod tests {
                 instrs: Vec::new(),
                 exits: vec![(Reg::Rsp, Operand::Entry(Reg::Rsp))],
                 callee_set: Vec::new(),
+                indirect_tail: None,
                 control: None,
                 terminator: b.terminator.clone(),
                 fused_cmp: None,
@@ -3442,6 +3767,7 @@ mod tests {
                 instrs: Vec::new(),
                 exits: vec![(Reg::Rsp, Operand::Entry(Reg::Rsp))],
                 callee_set: Vec::new(),
+                indirect_tail: None,
                 control: None,
                 terminator: b.terminator.clone(),
                 fused_cmp: None,

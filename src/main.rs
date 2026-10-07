@@ -8,6 +8,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+use cli::diag::cmd_unresolved;
 use cli::emit::{cmd_devirt, cmd_write_devirt};
 use cli::inspect::{cmd_dis, cmd_entries, cmd_info, cmd_trace, cmd_vmctx};
 use cli::recover::{cmd_cfg, cmd_lower, cmd_ssa};
@@ -156,6 +157,9 @@ enum Cmd {
         output: PathBuf,
         #[arg(long, default_value_t = 500_000)]
         steps: usize,
+        /// Maximum blocks to recover per function.
+        #[arg(long, default_value_t = 512)]
+        max_blocks: usize,
         /// Wall-clock backstop per function.
         #[arg(long, default_value_t = 600)]
         timeout: u64,
@@ -165,6 +169,12 @@ enum Cmd {
         /// Functions to recover concurrently. Defaults to `min(cores, 8)`.
         #[arg(long)]
         jobs: Option<usize>,
+        /// Recover only these discovered entry VAs (repeatable, comma-separated).
+        #[arg(long, value_parser = parse_u64, value_delimiter = ',')]
+        only_entry: Vec<u64>,
+        /// Append to a compatible derived image while analyzing the original input.
+        #[arg(long)]
+        patch_base: Option<PathBuf>,
     },
     /// Devirtualize one function into x86 machine code.
     Devirt {
@@ -177,11 +187,37 @@ enum Cmd {
         stack_base: u64,
         #[arg(long, default_value_t = 400_000)]
         steps: usize,
+        /// Maximum blocks to recover. 512 is the historical default and is kept:
+        /// raising it changes what the emitted function covers.
+        #[arg(long, default_value_t = 512)]
+        max_blocks: usize,
         #[arg(long, default_value_t = 120)]
         timeout: u64,
         /// Disassemble the emitted bytes after encoding.
         #[arg(long)]
         dis: bool,
+    },
+    /// Per-block diagnostics for a function whose recovery did not close.
+    Unresolved {
+        input: PathBuf,
+        #[arg(value_parser = parse_u64)]
+        va: u64,
+        #[arg(long, value_parser = parse_u64, default_value_t = vm::DEFAULT_STACK_BASE)]
+        stack_base: u64,
+        /// Instruction step budget, set to match the run being diagnosed.
+        #[arg(long, default_value_t = 400_000)]
+        steps: usize,
+        /// Maximum blocks to recover. The devirtualizer's own default is 512, and
+        /// it is kept here so that diagnosing the baseline measures the baseline.
+        /// Raising it is the point of an experiment, not of a comparison.
+        #[arg(long, default_value_t = 512)]
+        max_blocks: usize,
+        /// Wall-clock limit in seconds.
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+        /// Write the JSON here instead of stdout.
+        #[arg(long)]
+        json: Option<PathBuf>,
     },
 }
 
@@ -267,16 +303,30 @@ fn main() -> Result<()> {
             input,
             output,
             steps,
+            max_blocks,
             timeout,
             vm_section,
             jobs,
-        } => cmd_write_devirt(&input, &output, steps, timeout, &vm_section, jobs),
+            only_entry,
+            patch_base,
+        } => cmd_write_devirt(
+            &input,
+            &output,
+            steps,
+            max_blocks,
+            timeout,
+            &vm_section,
+            jobs,
+            &only_entry,
+            patch_base.as_deref(),
+        ),
         Cmd::Devirt {
             input,
             va,
             output,
             stack_base,
             steps,
+            max_blocks,
             timeout,
             dis,
         } => cmd_devirt(
@@ -285,6 +335,7 @@ fn main() -> Result<()> {
             output.as_deref(),
             stack_base,
             steps,
+            max_blocks,
             timeout,
             dis,
         ),
@@ -304,6 +355,23 @@ fn main() -> Result<()> {
             max_blocks,
             timeout,
             &vm_section,
+        ),
+        Cmd::Unresolved {
+            input,
+            va,
+            stack_base,
+            steps,
+            max_blocks,
+            timeout,
+            json,
+        } => cmd_unresolved(
+            &input,
+            va,
+            stack_base,
+            steps,
+            max_blocks,
+            timeout,
+            json.as_deref(),
         ),
     }
 }

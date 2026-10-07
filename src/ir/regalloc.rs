@@ -1,4 +1,4 @@
-//! Register allocation over scheduled blocks. 
+//! Register allocation over scheduled blocks.
 
 use iced_x86::{Decoder, DecoderOptions, InstructionInfoFactory, OpAccess};
 use std::collections::{HashMap, HashSet};
@@ -240,7 +240,7 @@ fn defined(i: &Instr) -> Option<ValId> {
         | Instr::Select { dst, .. }
         | Instr::Load { dst, .. }
         | Instr::Opaque { dst, .. } => Some(*dst),
-        Instr::Store { .. } | Instr::Call { .. } | Instr::Boxed { .. } => None,
+        Instr::Store { .. } | Instr::Call { .. } | Instr::Boxed { .. } | Instr::StackProbe { .. } => None,
     }
 }
 
@@ -289,6 +289,7 @@ fn used(i: &Instr) -> Vec<ValId> {
                 push(a);
             }
         }
+        Instr::StackProbe { top, size } => { push(top); push(size); }
         Instr::Opaque { .. } => {}
     }
     v
@@ -464,6 +465,7 @@ fn entry_regs_read(i: &Instr) -> Vec<Reg> {
                 push(a);
             }
         }
+        Instr::StackProbe { top, size } => { push(top); push(size); }
         Instr::Opaque { .. } => {}
     }
     v
@@ -1032,6 +1034,7 @@ mod tests {
             instrs,
             exits,
             callee_set: Vec::new(),
+            indirect_tail: None,
             control: None,
             terminator: Terminator::Unresolved {
                 reason: String::new(),

@@ -2,6 +2,11 @@
 
 A static devirtualizer targeting Tencent VM (TVM). Recovers virtualized control flow & attempts to lower guest behavior back to native x86.
 
+This fork integrates the recovery, diagnostics, native tail-call emission and
+incremental PE writeback used during the v9 recovery work. See
+[v9 integration and usage (中文)](docs/v9-integration.md) for the included changes,
+Windows build instructions, validation scope and remaining limitations.
+
 Devirtualized DriverEntry of ACE-GAME.sys.
 
 ![Claude, write me a devirtualizer](img/devirt_entry.png)
@@ -30,10 +35,19 @@ tvm-devirt lower input.exe 0x140001000
 tvm-devirt devirt input.exe 0x140001000 --output function.bin
 ```
 
-Devirtualize all recoverable functions, devirtualized code is appended at the end of .tvm0 section:
+Devirtualize all recoverable functions, appending code to the last PE section
+and marking that section executable:
 
 ```bash
 tvm-devirt write-devirt input.exe output.exe
+```
+
+Diagnose an incomplete function or extend a previous output while still analyzing
+the original input:
+
+```bash
+tvm-devirt unresolved input.dll 0x180001000 --json unresolved.json
+tvm-devirt write-devirt input.dll next.dll --patch-base previous.dll --only-entry 0x180001000 --max-blocks 1024
 ```
 
 Run `tvm-devirt --help` or `tvm-devirt <command> --help` for all options.
@@ -96,5 +110,6 @@ src/cli/      inspection, recovery, formatting, and writeback commands
 
 ## Credits
 
+- [NeuroSaki987/tvm-devirt-mirror](https://github.com/NeuroSaki987/tvm-devirt-mirror) for the integrated recovery diagnostics.
 - [k0mkc](https://k0mkc.hatenablog.com/archive/category/AntiCheatExpert)
 - [Back Engineering Labs](https://back.engineering/blog/31/07/2026/)

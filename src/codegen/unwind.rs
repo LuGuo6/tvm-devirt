@@ -20,8 +20,18 @@ pub struct PrologueInstr {
     pub step: PrologueStep,
 }
 
-/// Read the prologue's instruction lengths back out of the assembled bytes.
-pub(crate) fn measure_prologue(bytes: &[u8], layout: &FrameLayout) -> Vec<PrologueInstr> {
+/// Ordered host-frame probes, before the frame allocation. A smaller frame can
+/// cross at most one guard page, which the first actual stack store commits.
+pub(crate) fn frame_probe_offsets(frame_size: u32) -> Vec<u32> {
+    if frame_size < 4096 { return Vec::new(); }
+    let mut offsets: Vec<u32> = (4096..=frame_size).step_by(4096).collect();
+    if frame_size % 4096 != 0 { offsets.push(frame_size); }
+    offsets
+}
+
+/// Read and verify the prologue, including non-frame-changing page probes.
+/// Reject a prologue that Windows cannot describe rather than truncate metadata.
+pub(crate) fn measure_prologue(bytes: &[u8], layout: &FrameLayout) -> Result<Vec<PrologueInstr>> {
     let mut steps: Vec<PrologueStep> = Vec::new();
     if layout.frame_size > 0 {
         steps.push(PrologueStep::Alloc {
@@ -41,19 +51,48 @@ pub(crate) fn measure_prologue(bytes: &[u8], layout: &FrameLayout) -> Vec<Prolog
     let mut decoder = Decoder::new(64, bytes, DecoderOptions::NONE);
     let mut out = Vec::with_capacity(steps.len());
     let mut end = 0usize;
+    for displacement in frame_probe_offsets(layout.frame_size) {
+        let instruction = decoder.decode();
+        if instruction.mnemonic() != iced_x86::Mnemonic::Test
+            || instruction.memory_base() != iced_x86::Register::RSP
+            || instruction.memory_index() != iced_x86::Register::None
+            || instruction.memory_displacement64() as i64 != -(displacement as i64)
+            || instruction.op1_register() != iced_x86::Register::AL
+        {
+            bail!("host frame probe changed while optimizing prologue");
+        }
+        end += instruction.len();
+    }
     for step in steps {
         let instr = decoder.decode();
+        let matches_step = match step {
+            PrologueStep::Alloc { bytes } => {
+                instr.mnemonic() == iced_x86::Mnemonic::Sub
+                    && instr.op0_register() == iced_x86::Register::RSP
+                    && matches!(instr.op1_kind(), iced_x86::OpKind::Immediate8to64 | iced_x86::OpKind::Immediate32to64)
+                    && instr.immediate(1) == bytes as u64
+            }
+            PrologueStep::Save { reg, disp } => {
+                instr.mnemonic() == iced_x86::Mnemonic::Mov
+                    && instr.op0_kind() == iced_x86::OpKind::Memory
+                    && instr.memory_base() == iced_x86::Register::RSP
+                    && instr.memory_index() == iced_x86::Register::None
+                    && instr.memory_displacement64() == disp as u64
+                    && instr.op1_register() == ireg(reg, Width::W64)
+            }
+        };
+        if !matches_step { bail!("frame operation changed while optimizing prologue: {step:?}"); }
         end += instr.len();
         // A prologue longer than 255 bytes cannot be described at all, and the format gives no way to say so.
         if end > u8::MAX as usize {
-            break;
+            bail!("stack-probed prologue exceeds Windows unwind CodeOffset limit (255 bytes)");
         }
         out.push(PrologueInstr {
             end: end as u8,
             step,
         });
     }
-    out
+    Ok(out)
 }
 
 /// The register number an `UNWIND_CODE`'s `OpInfo` field uses. This is the architectural encoding, which is *not* the order `Reg` happens to be declared in, so it is spelled out.

@@ -4,7 +4,7 @@ use crate::cli::fmt::resolve_start;
 use crate::{
     binary::pe, binary::writeback, codegen, ir, ir::regalloc, ir::sched, vm::discover, vm::explore,
 };
-use anyhow::Result;
+use anyhow::{Result, bail};
 use iced_x86::{Decoder, DecoderOptions, Formatter, IntelFormatter};
 
 fn default_jobs() -> usize {
@@ -19,18 +19,42 @@ pub fn cmd_write_devirt(
     input: &std::path::Path,
     output: &std::path::Path,
     steps: usize,
+    max_blocks: usize,
     timeout: u64,
     vm_section: &str,
     jobs: Option<usize>,
+    only_entry: &[u64],
+    patch_base: Option<&std::path::Path>,
 ) -> Result<()> {
     let pe = pe::PeFile::load(input)?;
-    let entries = discover::find_vm_entries(&pe, vm_section);
+    let mut entries = discover::find_vm_entries(&pe, vm_section);
+    if !only_entry.is_empty() {
+        for va in only_entry {
+            if !entries.iter().any(|e| e.trampoline_va == *va) {
+                bail!("requested entry {va:#x} was not discovered in the original input");
+            }
+        }
+        entries.retain(|e| only_entry.contains(&e.trampoline_va));
+    }
+    if entries.is_empty() {
+        bail!("no VM entries selected");
+    }
+    let base = patch_base.map(pe::PeFile::load).transpose()?;
     let jobs = jobs.unwrap_or_else(default_jobs).max(1);
     eprintln!(
         "devirtualizing {} functions… ({jobs} at a time)",
         entries.len()
     );
-    let (out, report) = writeback::write_devirt(&pe, &entries, steps, timeout, vm_section, jobs)?;
+    let (out, report) = writeback::write_devirt(
+        &pe,
+        base.as_ref(),
+        &entries,
+        steps,
+        max_blocks,
+        timeout,
+        vm_section,
+        jobs,
+    )?;
     std::fs::write(output, &out)?;
     println!("wrote {} bytes to {:?}", out.len(), output);
 
@@ -53,7 +77,7 @@ pub fn cmd_write_devirt(
     }
 
     if !report.failed.is_empty() {
-        println!("  {} recovered but failed to lower:", report.failed.len());
+        println!("  {} rejected during writeback or lowering:", report.failed.len());
         let mut by_reason: std::collections::BTreeMap<&str, Vec<u64>> =
             std::collections::BTreeMap::new();
         for (va, reason) in &report.failed {
@@ -93,12 +117,14 @@ fn fmt_vas(vas: &[u64]) -> String {
 }
 
 /// Emit x86 machine code for one function and write it, or hex-dump to stdout.
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_devirt(
     path: &std::path::Path,
     va: u64,
     output: Option<&std::path::Path>,
     stack_base: u64,
     steps: usize,
+    max_blocks: usize,
     timeout: u64,
     dis: bool,
 ) -> Result<()> {
@@ -106,6 +132,7 @@ pub fn cmd_devirt(
     let start = resolve_start(&pe, va);
     let mut ex = explore::Explorer::new(&pe, stack_base);
     ex.step_budget = steps;
+    ex.block_budget = max_blocks;
     ex.time_budget = std::time::Duration::from_secs(timeout);
     let cfg = ex.recover(start);
 

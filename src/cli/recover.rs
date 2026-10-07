@@ -100,6 +100,9 @@ pub fn cmd_cfg(
                 println!("ret to {}", expr::render(&cfg.arena, *dest, 4))
             }
             ir::Terminator::TailCall { target } => println!("tailcall {target:#x}"),
+            ir::Terminator::IndirectTailCall { target } => {
+                println!("indirect tailcall {}", expr::render(&cfg.arena, *target, 4))
+            }
             ir::Terminator::Unresolved { reason } => println!("UNRESOLVED: {reason}"),
             ir::Terminator::Backedge { target } => println!("backedge -> {target}"),
             ir::Terminator::Adopted { taken, not_taken } => {
@@ -128,6 +131,7 @@ pub fn cmd_cfg(
         if show_events {
             for e in &b.events {
                 match e {
+                    lift::Event::StackProbe { site, top, size } => println!("      stack_probe @{site:#x} top={top:?} size={size:?}"),
                     lift::Event::Store {
                         addr,
                         value,
@@ -317,6 +321,7 @@ pub fn cmd_lower(
             ir::Terminator::Switch { targets, .. } => println!("    switch {} arms", targets.len()),
             ir::Terminator::Return { .. } => println!("    ret"),
             ir::Terminator::TailCall { target } => println!("    tail {target:#x}"),
+            ir::Terminator::IndirectTailCall { .. } => println!("    indirect tail"),
             ir::Terminator::Backedge { target } => println!("    loop -> {target}"),
             ir::Terminator::Adopted { taken, not_taken } => {
                 println!("    br(adopted) ? {taken} : {not_taken}")

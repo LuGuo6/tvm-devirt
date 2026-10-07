@@ -1,5 +1,5 @@
-//! The recovered control-flow graph: the IR every later stage consumes. 
-//! Separated from the recovery engine because the two have different audiences. 
+//! The recovered control-flow graph: the IR every later stage consumes.
+//! Separated from the recovery engine because the two have different audiences.
 //! [`crate::vm::explore`] is the only thing that builds a [`Cfg`]; scheduling, register allocation, lowering and writeback only read one.
 
 use crate::ir::expr::{self, Arena, Ref};
@@ -42,6 +42,9 @@ pub enum Terminator {
     Return { dest: Ref },
     /// Control left the function to a concrete address.
     TailCall { target: u64 },
+    /// Control leaves the function through a runtime-computed guest target.
+    /// This is not a RET and must remain live through frame teardown.
+    IndirectTailCall { target: Ref },
     /// Recovery failed here.
     Unresolved { reason: String },
     /// Loop back edge to an already-recovered block.
@@ -94,6 +97,30 @@ pub struct Block {
     pub cost: usize,
     /// Predecessors, filled in after recovery.
     pub preds: Vec<BlockId>,
+}
+
+impl Block {
+    /// Expressions consumed by the recovered guest program. Interpreter-only
+    /// memory events remain in the diagnostic trace, but scheduling never emits
+    /// them. Any value that escapes that scratch state still appears in a guest
+    /// effect, an exit register, or the terminator and is checked there.
+    pub(crate) fn semantic_roots(&self) -> Vec<Ref> {
+        let mut roots: Vec<Ref> = self.exit_regs.iter().map(|(_, v)| *v).collect();
+        for event in &self.events {
+            match event {
+                Event::Store { region, .. } | Event::Load { region, .. } if !region.is_guest() => {}
+                _ => event.append_roots(&mut roots),
+            }
+        }
+        match &self.terminator {
+            Terminator::Branch { predicate, .. } => roots.push(*predicate),
+            Terminator::Switch { selector, .. } => roots.push(*selector),
+            Terminator::Return { dest } => roots.push(*dest),
+            Terminator::IndirectTailCall { target } => roots.push(*target),
+            _ => {}
+        }
+        roots
+    }
 }
 
 #[derive(Debug)]
@@ -208,6 +235,7 @@ impl Cfg {
                     *selector = arena.rewrite(*selector, map);
                 }
                 Terminator::Return { dest } => *dest = arena.rewrite(*dest, map),
+                Terminator::IndirectTailCall { target } => *target = arena.rewrite(*target, map),
                 _ => {}
             }
         }
@@ -216,31 +244,7 @@ impl Cfg {
     /// Remove parameters that the block's body never reads.
     pub fn remove_dead_params(&mut self) {
         for b in &mut self.blocks {
-            let mut refs: Vec<Ref> = Vec::new();
-            for (_, v) in &b.exit_regs {
-                refs.push(*v);
-            }
-            for e in &b.events {
-                match e {
-                    Event::Store { addr, value, .. } | Event::Load { addr, value, .. } => {
-                        refs.push(*addr);
-                        refs.push(*value);
-                    }
-                    Event::Call { target, args, .. } => {
-                        if let Some(t) = target {
-                            refs.push(*t);
-                        }
-                        refs.extend(args.iter().map(|(_, v)| *v));
-                    }
-                    Event::Boxed { .. } => {}
-                }
-            }
-            match &b.terminator {
-                Terminator::Branch { predicate, .. } => refs.push(*predicate),
-                Terminator::Switch { selector, .. } => refs.push(*selector),
-                Terminator::Return { dest } => refs.push(*dest),
-                _ => {}
-            }
+            let refs = b.semantic_roots();
             let mut used: HashSet<Ref> = HashSet::new();
             for r in refs {
                 for leaf in expr::leaves(&self.arena, r) {
@@ -273,6 +277,7 @@ pub fn terminator_kind(t: &Terminator) -> &'static str {
         Terminator::Switch { .. } => "switch",
         Terminator::Return { .. } => "return",
         Terminator::TailCall { .. } => "tailcall",
+        Terminator::IndirectTailCall { .. } => "indirect tailcall",
         Terminator::Unresolved { .. } => "unresolved",
         Terminator::Backedge { .. } => "backedge",
         Terminator::Adopted { .. } => "branch (edges only)",
@@ -292,6 +297,10 @@ pub fn summarize(cfg: &Cfg) -> HashMap<&'static str, usize> {
 /// Rewrite the expressions inside an event through `map`.
 fn rewrite_event(arena: &mut Arena, e: &mut Event, map: &HashMap<Ref, Ref>) {
     match e {
+        Event::StackProbe { top, size, .. } => {
+            *top = arena.rewrite(*top, map);
+            *size = arena.rewrite(*size, map);
+        }
         Event::Store { addr, value, .. } => {
             *addr = arena.rewrite(*addr, map);
             *value = arena.rewrite(*value, map);
@@ -302,7 +311,9 @@ fn rewrite_event(arena: &mut Arena, e: &mut Event, map: &HashMap<Ref, Ref>) {
         }
         // `rsp` is a concrete stack pointer, not an expression, so there is
         // nothing in it to rewrite.
-        Event::Call { target, args, .. } => {
+        Event::Call {
+            target, args, ret, ..
+        } => {
             if let Some(t) = target {
                 *t = arena.rewrite(*t, map);
             }
@@ -311,7 +322,73 @@ fn rewrite_event(arena: &mut Arena, e: &mut Event, map: &HashMap<Ref, Ref>) {
             for (_, v) in args.iter_mut() {
                 *v = arena.rewrite(*v, map);
             }
+            if let Some(v) = ret {
+                *v = arena.rewrite(*v, map);
+            }
         }
-        Event::Boxed { .. } => {}
+        Event::Boxed {
+            mem, defs, uses, ..
+        } => {
+            if let Some(mem) = mem {
+                mem.addr = arena.rewrite(mem.addr, map);
+            }
+            for (_, v) in defs.iter_mut().chain(uses.iter_mut()) {
+                *v = arena.rewrite(*v, map);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod indirect_tail_tests {
+    use super::*;
+    use crate::ir::expr::{BlockRef, Reg, Width};
+
+    #[test]
+    fn indirect_tail_target_keeps_and_rewrites_its_only_parameter() {
+        let mut arena = Arena::new();
+        let param = arena.param(BlockRef(0), Reg::Rcx);
+        let target = arena.load(param, Width::W64);
+        let replacement = arena.init_reg(Reg::Rdx);
+        let id = BlockId {
+            handler: 0x1000,
+            vip: None,
+        };
+        let mut cfg = Cfg {
+            entry: id,
+            arena,
+            blocks: vec![Block {
+                id,
+                block_ref: BlockRef(0),
+                params: vec![(Reg::Rcx, param)],
+                events: vec![],
+                from_vm_context: false,
+                exit_regs: vec![],
+                terminator: Terminator::IndirectTailCall { target },
+                cost: 1,
+                preds: vec![],
+            }],
+            total_steps: 1,
+            unresolved: 0,
+            back_edges: vec![],
+            trivial_phis_removed: 0,
+            timed_out: false,
+            stack_base: 0x7000_0000,
+            vm_range: (0, 0),
+        };
+        cfg.remove_dead_params();
+        assert_eq!(cfg.blocks[0].params, vec![(Reg::Rcx, param)]);
+        cfg.apply_rewrite(&HashMap::from([(param, replacement)]));
+        let Terminator::IndirectTailCall { target: rewritten } = cfg.blocks[0].terminator else {
+            panic!("lost tail call")
+        };
+        assert_ne!(rewritten, target);
+        assert!(matches!(cfg.arena.op(rewritten), expr::Op::Load(addr,_) if *addr == replacement));
+        assert!(cfg.blocks[0].params.is_empty());
+        assert!(Cfg::successors(&cfg.blocks[0]).is_empty());
+        assert_eq!(
+            terminator_kind(&cfg.blocks[0].terminator),
+            "indirect tailcall"
+        );
     }
 }

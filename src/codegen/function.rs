@@ -3,6 +3,7 @@ use iced_x86::{
     BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, FlowControl, InstructionBlock,
     Mnemonic, OpKind, Register,
 };
+use iced_x86::{InstructionInfoFactory, OpAccess};
 
 /// Callee-saved registers written by the emitted function, in ABI order.
 ///
@@ -386,8 +387,24 @@ pub(crate) fn optimize_frame_traffic_with(
             .iter()
             .enumerate()
             .filter(|(i, _)| !dead[*i])
-            .map(|(_, x)| *x)
-            .collect();
+            .map(|(_, x)| {
+                // iced drops REX.W when re-encoding Jmp_rm64, but Windows needs
+                // it for tail-epilogue recognition. Register/base+disp targets
+                // have no RIP relocation: preserve their original bytes/IP.
+                let off = (x.ip() - base_va) as usize;
+                if x.flow_control() == FlowControl::IndirectBranch
+                    && !x.is_ip_rel_memory_operand()
+                    && bytes.get(off).is_some_and(|b| (0x48..=0x4f).contains(b))
+                {
+                    let mut raw =
+                        iced_x86::Instruction::with_declare_byte(&bytes[off..off + x.len()])?;
+                    raw.set_ip(x.ip());
+                    Ok(raw)
+                } else {
+                    Ok(*x)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
         if kept.len() == instrs.len() {
             return Ok(bytes);
         }
@@ -420,7 +437,10 @@ pub fn plan_frame(blocks: &[SchedBlock], allocs: &[Alloc]) -> FrameLayout {
     let spill_slots = allocs.iter().map(|a| a.slots).max().unwrap_or(0);
     let has_calls = blocks.iter().any(|b| {
         b.instrs.iter().any(|i| matches!(i, Instr::Call { .. }))
-            || matches!(b.terminator, Terminator::TailCall { .. })
+            || matches!(
+                b.terminator,
+                Terminator::TailCall { .. } | Terminator::IndirectTailCall { .. }
+            )
     });
     let saves = saved_registers(blocks, allocs);
     // The widest call in the function decides the outgoing argument area, since one
@@ -469,7 +489,13 @@ pub fn emit_function_full(
         label_of.insert(b.id, asm.create_label());
     }
 
-    // Emit the function prologue on the entry block. The frame is reserved first, then the callee-saved registers are written into it.
+    // Commit a large host frame a page at a time before moving RSP. No GPR or
+    // RSP changes at a faulting TEST, so partial-prologue unwinding stays simple.
+    // The last partial page must also be touched before spilling into it.
+    for displacement in frame_probe_offsets(layout.frame_size) {
+        asm.test(byte_ptr(rsp - displacement as i32), al)?;
+    }
+    // Emit the function prologue on the entry block, then save nonvolatiles.
     if layout.frame_size > 0 {
         asm.sub(rsp, layout.frame_size as i32)?;
     }
@@ -545,7 +571,7 @@ pub fn emit_function_full(
     validate_emitted(&bytes, base_va, &label_of, blocks, &layout)?;
 
     // Measure the prologue by decoding what was actually emitted.
-    let prologue = measure_prologue(&bytes, &layout);
+    let prologue = measure_prologue(&bytes, &layout)?;
 
     Ok(EmittedFn { bytes, prologue })
 }
@@ -600,12 +626,29 @@ pub(crate) fn validate_emitted(
         );
     }
 
+    // Check the host stack invariant on reachable emitted control flow before
+    // considering frame bounds. Every generated function has one fixed host
+    // frame: paths may temporarily move RSP for calls, pushes, or probes, but
+    // all returns and tail transfers must observe the entry stack pointer.
+    verify_host_rsp(bytes, base_va)?;
+
     // Re-scan for branch targets and frame accesses.
     decoder = Decoder::with_ip(64, bytes, base_va, DecoderOptions::NONE);
     let mut bad_branches: Vec<String> = Vec::new();
     let mut bad_frame: Vec<String> = Vec::new();
+    let probes = frame_probe_offsets(layout.frame_size);
+    let mut instruction_index = 0;
     while decoder.can_decode() {
         let instr = decoder.decode();
+        let is_host_probe = probes.get(instruction_index).is_some_and(|offset| {
+            instr.mnemonic() == Mnemonic::Test
+                && instr.op0_kind() == OpKind::Memory
+                && instr.memory_base() == Register::RSP
+                && instr.memory_index() == Register::None
+                && instr.memory_displacement64() as i64 == -(*offset as i64)
+                && instr.op1_register() == Register::AL
+        });
+        instruction_index += 1;
         // Check branch targets land on instruction boundaries.
         match instr.flow_control() {
             FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch => {
@@ -623,7 +666,10 @@ pub(crate) fn validate_emitted(
             _ => {}
         }
         // Check frame accesses stay within bounds.
-        if instr.memory_base() == Register::RSP && instr.memory_index() == Register::None {
+        if !is_host_probe
+            && instr.memory_base() == Register::RSP
+            && instr.memory_index() == Register::None
+        {
             let disp = instr.memory_displacement64() as i64;
             // Frame accesses are [rsp+k] where k is frame_disp(o) for some offset o.
             // Negative displacements are outgoing arguments (above RSP) or the return
@@ -660,4 +706,279 @@ pub(crate) fn validate_emitted(
         );
     }
     Ok(())
+}
+
+/// Verify the fixed host-frame invariant on the reachable emitted CFG.
+///
+/// The state is the signed displacement of RSP from the entry value. Calls are
+/// modelled as net zero because their return address push/pop is one ABI action;
+/// ordinary push/pop and the explicit frame adjustments are propagated. A merge
+/// with a different displacement, an unrecognised RSP write, or a non-zero
+/// displacement at RET/tail transfer is rejected.
+fn verify_host_rsp(bytes: &[u8], base_va: u64) -> Result<()> {
+    if bytes.is_empty() {
+        bail!("host RSP check: empty body");
+    }
+    let mut decoder = Decoder::with_ip(64, bytes, base_va, DecoderOptions::NONE);
+    let mut instructions = Vec::new();
+    while decoder.can_decode() {
+        let ins = decoder.decode();
+        if ins.is_invalid() {
+            bail!("host RSP check: invalid instruction at {:#x}", ins.ip());
+        }
+        instructions.push(ins);
+    }
+    if decoder.ip() != base_va + bytes.len() as u64 {
+        bail!("host RSP check: decoder stopped at {:#x}", decoder.ip());
+    }
+    let starts: HashMap<u64, usize> = instructions
+        .iter()
+        .enumerate()
+        .map(|(i, ins)| (ins.ip(), i))
+        .collect();
+    let mut seen: HashMap<usize, i64> = HashMap::new();
+    let mut queue = std::collections::VecDeque::from([(0usize, 0i64)]);
+    while let Some((index, delta)) = queue.pop_front() {
+        if let Some(old) = seen.get(&index) {
+            if *old != delta {
+                bail!(
+                    "host RSP check: merge at {:#x} has deltas {old} and {delta}",
+                    instructions[index].ip()
+                );
+            }
+            continue;
+        }
+        seen.insert(index, delta);
+        let ins = &instructions[index];
+        if matches!(
+            ins.mnemonic(),
+            Mnemonic::Int3 | Mnemonic::Ud2 | Mnemonic::Hlt
+        ) {
+            continue;
+        }
+        let effect = host_rsp_effect(ins)?;
+        let next_delta = delta
+            .checked_add(effect)
+            .ok_or_else(|| anyhow::anyhow!("host RSP check: delta overflow at {:#x}", ins.ip()))?;
+
+        let mut edge = |target: Option<usize>, edge_name: &str| -> Result<()> {
+            let Some(target) = target else {
+                if next_delta != 0 {
+                    bail!(
+                        "host RSP check: {edge_name} exits at {:#x} with non-zero RSP delta {next_delta}",
+                        ins.ip()
+                    );
+                }
+                return Ok(());
+            };
+            if let Some(old) = seen.get(&target) {
+                if *old != next_delta {
+                    bail!(
+                        "host RSP check: merge at {:#x} has deltas {old} and {next_delta}",
+                        instructions[target].ip()
+                    );
+                }
+            } else {
+                queue.push_back((target, next_delta));
+            }
+            Ok(())
+        };
+
+        match ins.flow_control() {
+            FlowControl::Return => {
+                if next_delta != 0 {
+                    bail!(
+                        "host RSP check: RET at {:#x} has non-zero RSP delta {next_delta}",
+                        ins.ip()
+                    );
+                }
+            }
+            FlowControl::IndirectBranch => {
+                if next_delta != 0 {
+                    bail!(
+                        "host RSP check: indirect tail at {:#x} has non-zero RSP delta {next_delta}",
+                        ins.ip()
+                    );
+                }
+            }
+            FlowControl::UnconditionalBranch => {
+                if (base_va..base_va + bytes.len() as u64).contains(&ins.near_branch64())
+                    && !starts.contains_key(&ins.near_branch64())
+                {
+                    bail!("host RSP check: branch targets a non-instruction boundary");
+                }
+                let target = starts.get(&ins.near_branch64()).copied();
+                edge(target, "external tail jump")?;
+            }
+            FlowControl::ConditionalBranch => {
+                if (base_va..base_va + bytes.len() as u64).contains(&ins.near_branch64())
+                    && !starts.contains_key(&ins.near_branch64())
+                {
+                    bail!("host RSP check: branch targets a non-instruction boundary");
+                }
+                let target = starts.get(&ins.near_branch64()).copied();
+                edge(target, "conditional external edge")?;
+                edge(
+                    index.checked_add(1).filter(|i| *i < instructions.len()),
+                    "fallthrough",
+                )?;
+            }
+            FlowControl::Exception | FlowControl::XbeginXabortXend | FlowControl::Interrupt => {
+                bail!(
+                    "host RSP check: unsupported control flow at {:#x}",
+                    ins.ip()
+                );
+            }
+            _ => {
+                edge(
+                    index.checked_add(1).filter(|i| *i < instructions.len()),
+                    "fallthrough",
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn host_rsp_effect(ins: &iced_x86::Instruction) -> Result<i64> {
+    match ins.mnemonic() {
+        Mnemonic::Call => return Ok(0),
+        Mnemonic::Ret => return Ok(0),
+        Mnemonic::Push | Mnemonic::Pushfq | Mnemonic::Popfq => {
+            return Ok(ins.stack_pointer_increment() as i64);
+        }
+        Mnemonic::Pop => {
+            if ins.op0_register() == Register::RSP {
+                bail!("host RSP check: dynamic pop rsp at {:#x}", ins.ip());
+            }
+            return Ok(ins.stack_pointer_increment() as i64);
+        }
+        Mnemonic::Add | Mnemonic::Sub
+            if ins.op0_register() == Register::RSP
+                && matches!(
+                    ins.op1_kind(),
+                    OpKind::Immediate8
+                        | OpKind::Immediate8to32
+                        | OpKind::Immediate8to64
+                        | OpKind::Immediate16
+                        | OpKind::Immediate32
+                        | OpKind::Immediate32to64
+                        | OpKind::Immediate64
+                ) =>
+        {
+            let value = match ins.op1_kind() {
+                OpKind::Immediate8 => ins.immediate8() as i8 as i64,
+                OpKind::Immediate8to32 | OpKind::Immediate8to64 => ins.immediate8to64() as i64,
+                OpKind::Immediate16 => ins.immediate16() as i16 as i64,
+                OpKind::Immediate32 => ins.immediate32() as i32 as i64,
+                OpKind::Immediate32to64 => ins.immediate32to64() as i64,
+                OpKind::Immediate64 => ins.immediate64() as i64,
+                _ => unreachable!("immediate kind checked above"),
+            };
+            return Ok(if ins.mnemonic() == Mnemonic::Add {
+                value
+            } else {
+                value.checked_neg().ok_or_else(|| {
+                    anyhow::anyhow!("host RSP check: subtract overflow at {:#x}", ins.ip())
+                })?
+            });
+        }
+        Mnemonic::Lea
+            if ins.op0_register() == Register::RSP
+                && ins.op1_kind() == OpKind::Memory
+                && ins.memory_base() == Register::RSP
+                && ins.memory_index() == Register::None =>
+        {
+            return Ok(ins.memory_displacement64() as i64);
+        }
+        Mnemonic::Mov
+            if ins.op0_kind() == OpKind::Register
+                && ins.op0_register() == Register::RSP
+                && ins.op1_kind() == OpKind::Register
+                && ins.op1_register() == Register::RSP =>
+        {
+            return Ok(0);
+        }
+        _ => {}
+    }
+
+    let mut factory = InstructionInfoFactory::new();
+    let writes_rsp = factory.info(ins).used_registers().iter().any(|used| {
+        used.register().full_register() == Register::RSP
+            && matches!(
+                used.access(),
+                OpAccess::Write
+                    | OpAccess::ReadWrite
+                    | OpAccess::CondWrite
+                    | OpAccess::ReadCondWrite
+            )
+    });
+    if writes_rsp {
+        bail!(
+            "host RSP check: unrecognised RSP write {:?} at {:#x}",
+            ins.mnemonic(),
+            ins.ip()
+        );
+    }
+    Ok(0)
+}
+
+#[cfg(test)]
+mod host_rsp_tests {
+    use super::verify_host_rsp;
+
+    #[test]
+    fn rejects_positive_stack_drift_before_return() {
+        // sub rsp, 20h; lea rsp,[rsp+1a0h]; ret => +180h at RET.
+        let bytes = [
+            0x48, 0x83, 0xec, 0x20, 0x48, 0x8d, 0xa4, 0x24, 0xa0, 0x01, 0x00, 0x00, 0xc3,
+        ];
+        let err = verify_host_rsp(&bytes, 0x1000).unwrap_err().to_string();
+        assert!(
+            err.contains("non-zero RSP delta") || err.contains("RSP"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn accepts_a_stack_neutral_conditional_loop() {
+        // jnz $-0x2: a reachable positive loop with no host-stack mutation.
+        verify_host_rsp(&[0x75, 0xfe, 0xc3], 0x1000).unwrap();
+    }
+
+    #[test]
+    fn accepts_call_net_zero_then_return() {
+        // call +0; ret. The call's push/pop is one ABI operation and has net 0.
+        verify_host_rsp(&[0xe8, 0xfb, 0x00, 0x00, 0x00, 0xc3], 0x1000).unwrap();
+    }
+
+    #[test]
+    fn rejects_conflicting_stack_deltas_at_a_merge() {
+        // jnz ret; fallthrough sub rsp,8 then jump to the same RET.
+        let bytes = [0x75, 0x06, 0x48, 0x83, 0xec, 0x08, 0xeb, 0x00, 0xc3];
+        assert!(
+            verify_host_rsp(&bytes, 0x1000)
+                .unwrap_err()
+                .to_string()
+                .contains("merge")
+        );
+    }
+
+    #[test]
+    fn rejects_dynamic_host_rsp_write() {
+        // mov rsp,rax cannot be represented by the fixed-frame delta model.
+        let bytes = [0x48, 0x89, 0xc4, 0xc3];
+        assert!(
+            verify_host_rsp(&bytes, 0x1000)
+                .unwrap_err()
+                .to_string()
+                .contains("unrecognised RSP write")
+        );
+    }
+
+    #[test]
+    fn accepts_external_tail_jump_only_at_entry_delta() {
+        // jmp outside this emitted body is a tail transfer; delta is zero.
+        verify_host_rsp(&[0xe9, 0xfb, 0x00, 0x00, 0x00], 0x1000).unwrap();
+    }
 }

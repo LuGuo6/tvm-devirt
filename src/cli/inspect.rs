@@ -206,6 +206,7 @@ pub fn cmd_trace(
     if show_events {
         for e in &emu.events {
             match e {
+                lift::Event::StackProbe { site, top, size } => println!("  stack_probe @{site:#x} top={top:?} size={size:?}"),
                 lift::Event::Store {
                     addr, width, site, ..
                 } => println!(

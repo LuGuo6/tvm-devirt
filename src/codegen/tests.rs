@@ -9,6 +9,73 @@ use crate::ir::expr::BinOp;
 use crate::ir::regalloc::{Item, Segment};
 use crate::ir::sched::ValId;
 
+#[test]
+fn stack_probe_codegen_preserves_effect_and_exports_differential_fixtures() {
+    for kind in ["registers", "swapped", "spills", "frame"] {
+        let mut alloc = Alloc::default();
+        let (top, size) = match kind {
+            "swapped" => {
+                alloc.segments.extend([seg(Item::Entry(Reg::Rax), Reg::Rax), seg(Item::Entry(Reg::Rcx), Reg::Rcx)]);
+                (Operand::Entry(Reg::Rax), Operand::Entry(Reg::Rcx))
+            }
+            "spills" => {
+                alloc.slots = 2;
+                for (slot, reg) in [Reg::Rcx, Reg::Rdx].into_iter().enumerate() {
+                    alloc.segments.push(Segment { item: Item::Entry(reg), start: 0, end: 8, loc: Loc::Spill(slot as u32) });
+                }
+                (Operand::Entry(Reg::Rcx), Operand::Entry(Reg::Rdx))
+            }
+            "frame" => {
+                alloc.segments.push(seg(Item::Entry(Reg::Rdx), Reg::Rdx));
+                (Operand::Frame(-0x218), Operand::Entry(Reg::Rdx))
+            }
+            _ => {
+                alloc.segments.extend([seg(Item::Entry(Reg::Rcx), Reg::Rcx), seg(Item::Entry(Reg::Rdx), Reg::Rdx)]);
+                (Operand::Entry(Reg::Rcx), Operand::Entry(Reg::Rdx))
+            }
+        };
+        let layout = FrameLayout::new(-0x3400, alloc.slots, false);
+        let mut asm = CodeAssembler::new(64).unwrap();
+        for displacement in frame_probe_offsets(layout.frame_size) {
+            asm.test(byte_ptr(rsp - displacement as i32), al).unwrap();
+        }
+        asm.sub(rsp, layout.frame_size as i32).unwrap();
+        if kind == "spills" {
+            asm.mov(qword_ptr(rsp + layout.spill_disp(0) as i32), rcx).unwrap();
+            asm.mov(qword_ptr(rsp + layout.spill_disp(1) as i32), rdx).unwrap();
+        }
+        emit_instr(&mut asm, &alloc, &Instr::StackProbe { top, size }, 0, &layout, ImageRange::none(), None, &CallRedirects::none()).unwrap();
+        asm.add(rsp, layout.frame_size as i32).unwrap();
+        asm.ret().unwrap();
+        let bytes = optimize_frame_traffic_with(asm.assemble(0x100000).unwrap(), 0x100000, Some(&layout)).unwrap();
+        let prologue = measure_prologue(&bytes, &layout).unwrap();
+        assert_eq!(prologue.len(), 1);
+        assert!(prologue[0].end > 7, "page tests precede the allocation");
+        let decoded: Vec<_> = iced_x86::Decoder::with_ip(64, &bytes, 0x100000, 0).into_iter().collect();
+        assert_eq!(decoded.iter().filter(|i| i.mnemonic() == iced_x86::Mnemonic::Test && i.memory_base() == iced_x86::Register::RCX).count(), 1);
+        assert_eq!(decoded.iter().filter(|i| i.mnemonic() == iced_x86::Mnemonic::Jge).count(), 1);
+        if let Some(dir) = std::env::var_os("TVM_STACK_PROBE_FIXTURE_DIR") {
+            let dir = std::path::PathBuf::from(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("{kind}.bin")), &bytes).unwrap();
+            std::fs::write(dir.join(format!("{kind}.xdata")), unwind_info(&prologue)).unwrap();
+            std::fs::write(dir.join(format!("{kind}.json")), format!("{{\"kind\":\"{kind}\",\"frame_size\":{},\"prologue_size\":{},\"code_size\":{}}}",layout.frame_size, prologue.last().unwrap().end, bytes.len())).unwrap();
+        }
+    }
+}
+
+#[test]
+fn stack_probe_prologue_rejects_unrepresentable_unwind_offsets() {
+    let layout = FrameLayout::new(-0x100000, 0, false);
+    let mut asm = CodeAssembler::new(64).unwrap();
+    for displacement in frame_probe_offsets(layout.frame_size) {
+        asm.test(byte_ptr(rsp - displacement as i32), al).unwrap();
+    }
+    asm.sub(rsp, layout.frame_size as i32).unwrap();
+    let bytes = asm.assemble(0x100000).unwrap();
+    assert!(measure_prologue(&bytes, &layout).unwrap_err().to_string().contains("255"));
+}
+
 /// Assemble one `Instr` with a hand-written allocation and disassemble it.
 fn emit_one(instr: &Instr, segs: Vec<Segment>) -> Vec<String> {
     let mut asm = CodeAssembler::new(64).expect("assembler");
@@ -562,6 +629,7 @@ fn a_tail_call_to_a_retargeted_trampoline_names_the_body() {
         instrs: Vec::new(),
         exits: Vec::new(),
         callee_set: Vec::new(),
+        indirect_tail: None,
         control: None,
         terminator: Terminator::TailCall {
             target: 0x140002bec,
@@ -590,6 +658,403 @@ fn a_tail_call_to_a_retargeted_trampoline_names_the_body() {
         text.iter().any(|t| t == "jmp 00000001402C1370h"),
         "tail call should reach the body, got {text:?}"
     );
+}
+
+/// Exercise the epilogue using synthetic allocations that deliberately put the
+/// vtable address where argument moves, spills or callee-saved restores could
+/// destroy it. Optional fixture export is consumed by the Unicorn regression.
+#[test]
+fn indirect_tail_epilogue_preserves_parallel_moves_spills_and_restores() {
+    for kind in [
+        "argument_moves",
+        "swap",
+        "nonvolatile",
+        "spill",
+        "displacement",
+        "register_rdx",
+        "register_r10",
+        "register_r9",
+    ] {
+        let target_reg = match kind {
+            "register_rdx" => Some(Reg::Rdx),
+            "register_r10" => Some(Reg::R10),
+            "register_r9" => Some(Reg::R9),
+            _ => None,
+        };
+        let displacement = if kind == "displacement" { 0x20 } else { 0 };
+        let mut arena = crate::ir::expr::Arena::new();
+        let address_ref = arena.init_reg(Reg::Rcx);
+        let target = arena.load(address_ref, Width::W64);
+        let value = ValId(0);
+        let address = if matches!(kind, "nonvolatile" | "spill") || target_reg.is_some() {
+            Operand::Val(value)
+        } else {
+            Operand::Entry(Reg::Rcx)
+        };
+        let mut segments = vec![seg(Item::Entry(Reg::Rdx), Reg::Rdx)];
+        let target_segment = match kind {
+            "nonvolatile" | "register_rdx" | "register_r10" | "register_r9" => {
+                seg(Item::Val(value), Reg::Rbx)
+            }
+            "spill" => Segment {
+                item: Item::Val(value),
+                start: 0,
+                end: 8,
+                loc: Loc::Spill(0),
+            },
+            _ => seg(Item::Entry(Reg::Rcx), Reg::Rcx),
+        };
+        segments.push(target_segment);
+        if kind == "swap" {
+            segments.push(seg(Item::Entry(Reg::Rax), Reg::Rax));
+        }
+        let alloc = Alloc {
+            segments,
+            copies: vec![],
+            slots: u32::from(kind == "spill"),
+        };
+        let mut exits = vec![
+            (
+                Reg::Rax,
+                if target_reg.is_some() {
+                    Operand::Imm(0x1234)
+                } else {
+                    address
+                },
+            ),
+            (
+                Reg::Rcx,
+                Operand::Entry(if kind == "swap" { Reg::Rax } else { Reg::Rdx }),
+            ),
+            (
+                Reg::Rdx,
+                if target_reg == Some(Reg::Rdx) {
+                    address
+                } else {
+                    Operand::Imm(1)
+                },
+            ),
+        ];
+        if let Some(reg) = target_reg.filter(|r| *r != Reg::Rdx) {
+            exits.push((reg, address));
+        }
+        let b = SchedBlock {
+            id: BlockId {
+                handler: 0x1000,
+                vip: None,
+            },
+            instrs: vec![],
+            exits,
+            callee_set: vec![],
+            indirect_tail: Some(if target_reg.is_some() {
+                sched::IndirectTailKind::Register
+            } else {
+                sched::IndirectTailKind::Memory { displacement }
+            }),
+            control: Some(address),
+            fused_cmp: None,
+            terminator: Terminator::IndirectTailCall { target },
+        };
+        let saves = if kind == "nonvolatile" || target_reg.is_some() {
+            vec![Reg::Rbx, Reg::R15]
+        } else {
+            vec![Reg::R15]
+        };
+        let layout = FrameLayout::with_saves(0, alloc.slots, true, saves);
+        let mut asm = CodeAssembler::new(64).unwrap();
+        asm.sub(rsp, layout.frame_size as i32).unwrap();
+        for &r in layout.saves() {
+            asm.mov(
+                qword_ptr(rsp + layout.save_disp(r).unwrap() as i32),
+                qreg(r),
+            )
+            .unwrap();
+        }
+        asm.mov(r15, 0x55aa_u64).unwrap();
+        if kind == "nonvolatile" {
+            asm.mov(rbx, rcx).unwrap();
+        }
+        if target_reg.is_some() {
+            asm.mov(rbx, qword_ptr(rcx)).unwrap();
+        }
+        if kind == "spill" {
+            asm.mov(qword_ptr(rsp + layout.spill_disp(0) as i32), rcx)
+                .unwrap();
+        }
+        let moves = regalloc::reconcile(&b, &alloc);
+        emit_terminator(
+            &mut asm,
+            &alloc,
+            &b,
+            &moves,
+            &HashMap::new(),
+            &layout,
+            None,
+            &CallRedirects::none(),
+        )
+        .unwrap();
+        let bytes =
+            optimize_frame_traffic_with(asm.assemble(0x100000).unwrap(), 0x100000, Some(&layout))
+                .unwrap();
+        let decoded: Vec<_> = iced_x86::Decoder::with_ip(64, &bytes, 0x100000, 0)
+            .into_iter()
+            .collect();
+        let last = decoded.last().unwrap();
+        assert_eq!(last.flow_control(), iced_x86::FlowControl::IndirectBranch);
+        assert!(
+            (0x48..=0x4f).contains(&bytes[(last.ip() - 0x100000) as usize]),
+            "must retain REX.W"
+        );
+        if let Some(reg) = target_reg {
+            assert_eq!(last.op0_register(), ireg(reg, Width::W64));
+        } else {
+            assert_eq!(last.memory_base(), iced_x86::Register::RAX);
+            assert_eq!(last.memory_displacement64(), displacement as u64);
+        }
+        assert!(
+            !decoded
+                .iter()
+                .any(|i| i.mnemonic() == iced_x86::Mnemonic::Ret)
+        );
+        assert_eq!(
+            decoded[decoded.len() - 2].mnemonic(),
+            iced_x86::Mnemonic::Add
+        );
+        assert_eq!(
+            decoded[decoded.len() - 2].op0_register(),
+            iced_x86::Register::RSP
+        );
+        if let Some(dir) = std::env::var_os("TVM_TAIL_FIXTURE_DIR") {
+            let dir = std::path::PathBuf::from(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("{kind}.bin")), &bytes).unwrap();
+            let metadata = format!(
+                "{{\"kind\":\"{kind}\",\"base\":1048576,\"frame_size\":{},\"size\":{},\"rcx_from\":\"{}\",\"displacement\":{displacement},\"target_reg\":\"{}\"}}",
+                layout.frame_size,
+                bytes.len(),
+                if kind == "swap" { "rax" } else { "rdx" },
+                target_reg.map(|r| r.name()).unwrap_or("")
+            );
+            std::fs::write(dir.join(format!("{kind}.json")), metadata).unwrap();
+        }
+    }
+}
+
+#[test]
+fn indirect_tail_rejects_unproven_address_registers() {
+    let mut arena = crate::ir::expr::Arena::new();
+    let addr = arena.init_reg(Reg::Rcx);
+    let target = arena.load(addr, Width::W64);
+    for reg in [Reg::Rsp, Reg::Rbp, Reg::R13, Reg::Rbx] {
+        let b = SchedBlock {
+            id: BlockId {
+                handler: 0x1000,
+                vip: None,
+            },
+            instrs: vec![],
+            exits: vec![(reg, Operand::Val(ValId(0)))],
+            callee_set: vec![],
+            indirect_tail: Some(sched::IndirectTailKind::Memory { displacement: 0 }),
+            control: Some(Operand::Val(ValId(0))),
+            fused_cmp: None,
+            terminator: Terminator::IndirectTailCall { target },
+        };
+        let layout = FrameLayout::with_saves(0, 0, false, vec![reg]);
+        let mut asm = CodeAssembler::new(64).unwrap();
+        let result = emit_terminator(
+            &mut asm,
+            &Alloc::default(),
+            &b,
+            &[],
+            &HashMap::new(),
+            &layout,
+            None,
+            &CallRedirects::none(),
+        );
+        assert!(result.is_err(), "unproven {reg:?} should not be accepted");
+    }
+}
+
+#[test]
+fn rex_w_tail_jumps_survive_frame_cleanup_and_branch_relocation() {
+    for (reg, disp) in [
+        (Reg::Rdx, None),
+        (Reg::R10, None),
+        (Reg::R9, None),
+        (Reg::Rax, Some(0)),
+        (Reg::Rax, Some(0x20)),
+        (Reg::R12, Some(0)),
+    ] {
+        let mut asm = CodeAssembler::new(64).unwrap();
+        let mut tail = asm.create_label();
+        asm.jmp(tail).unwrap();
+        // Unreachable removable traffic forces optimizer decode/re-encode.
+        asm.mov(r11, qword_ptr(rsp + 0x100_i32)).unwrap();
+        asm.mov(qword_ptr(rsp + 0x100_i32), r11).unwrap();
+        asm.set_label(&mut tail).unwrap();
+        emit_rex_w_tail_jump(&mut asm, reg, disp).unwrap();
+        let before = asm.assemble(0x1000).unwrap();
+        let bytes = optimize_frame_traffic(before.clone(), 0x1000).unwrap();
+        assert!(bytes.len() + 8 < before.len(), "must exercise re-encoding");
+        let decoded: Vec<_> = iced_x86::Decoder::with_ip(64, &bytes, 0x1000, 0)
+            .into_iter()
+            .collect();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].near_branch_target(), decoded[1].ip());
+        let jump = &decoded[1];
+        let offset = (jump.ip() - 0x1000) as usize;
+        assert!(
+            (0x48..=0x4f).contains(&bytes[offset]),
+            "Windows requires REX.W"
+        );
+        assert_eq!(jump.flow_control(), iced_x86::FlowControl::IndirectBranch);
+        match disp {
+            Some(d) => {
+                assert_eq!(jump.memory_base(), ireg(reg, Width::W64));
+                assert_eq!(jump.memory_displacement64() as i64, d as i64);
+            }
+            None => assert_eq!(jump.op0_register(), ireg(reg, Width::W64)),
+        }
+    }
+}
+
+#[test]
+fn call_return_object_survives_virtual_tail_target_and_argument_setup() {
+    use crate::ir::Block;
+    use crate::ir::expr::{Arena, BlockRef};
+    use crate::ir::lift::{Event, Region};
+    for narrow_args in [false, true] {
+        let mut arena = Arena::new();
+        let object = arena.opaque("call_ret", Width::W64);
+        let table = arena.load(object, Width::W64);
+        let offset = arena.constant(0x28, Width::W64);
+        let slot = arena.bin(BinOp::Add, table, offset);
+        let target = arena.load(slot, Width::W64);
+        let call_target = arena.constant(0x105000, Width::W64);
+        let mask = arena.constant(0xffff_ffff, Width::W64);
+        let incoming_rdx = arena.init_reg(Reg::Rdx);
+        let incoming_r8 = arena.init_reg(Reg::R8);
+        let rdx_narrow = arena.bin(BinOp::And, incoming_rdx, mask);
+        let r8_narrow = arena.bin(BinOp::And, incoming_r8, mask);
+        let stack_base = 0x7ff0_0000;
+        let id = BlockId {
+            handler: 0x100000,
+            vip: None,
+        };
+        let target_reg = if narrow_args { Reg::R10 } else { Reg::Rdx };
+        let mut exits = vec![(Reg::Rax, object), (Reg::Rcx, object), (target_reg, target)];
+        if narrow_args {
+            exits.extend([(Reg::Rdx, rdx_narrow), (Reg::R8, r8_narrow)]);
+        }
+        let cfg = Cfg {
+            entry: id,
+            arena,
+            blocks: vec![Block {
+                id,
+                block_ref: BlockRef(0),
+                params: vec![],
+                from_vm_context: false,
+                events: vec![
+                    Event::Call {
+                        target: Some(call_target),
+                        site: 0x100000,
+                        rsp: Some(stack_base - 0x28),
+                        import_slot: None,
+                        args: vec![],
+                        ret: Some(object),
+                    },
+                    Event::Load {
+                        addr: object,
+                        value: table,
+                        width: Width::W64,
+                        site: 0x100005,
+                        region: Region::Guest,
+                    },
+                    Event::Load {
+                        addr: slot,
+                        value: target,
+                        width: Width::W64,
+                        site: 0x100008,
+                        region: Region::Guest,
+                    },
+                ],
+                exit_regs: exits,
+                terminator: Terminator::IndirectTailCall { target },
+                cost: 3,
+                preds: vec![],
+            }],
+            total_steps: 3,
+            unresolved: 0,
+            back_edges: vec![],
+            trivial_phis_removed: 0,
+            timed_out: false,
+            stack_base,
+            vm_range: (0, 0),
+        };
+        let blocks = sched::schedule(&cfg);
+        let block = &blocks[0];
+        let rax_exit = block
+            .exits
+            .iter()
+            .find(|(r, _)| *r == Reg::Rax)
+            .expect("call_ret RAX is a real exit value")
+            .1;
+        let rcx_exit = block
+            .exits
+            .iter()
+            .find(|(r, _)| *r == Reg::Rcx)
+            .expect("call_ret RCX must be reconciled")
+            .1;
+        assert_eq!(rax_exit, rcx_exit);
+        assert!(!block.callee_set.contains(&Reg::Rax) && !block.callee_set.contains(&Reg::Rcx));
+        let allocs: Vec<_> = blocks.iter().map(regalloc::allocate).collect();
+        let pe = PeFile {
+            data: vec![],
+            image_base: 0x100000,
+            entry_point_rva: 0,
+            size_of_image: 0x30000,
+            sections: vec![],
+            opt_header_offset: 0,
+            section_table_offset: 0,
+            file_alignment: 0x200,
+            section_alignment: 0x1000,
+            size_of_headers: 0,
+            loader_bound: vec![],
+        };
+        let emitted = emit_function_full(
+            &cfg,
+            &blocks,
+            &allocs,
+            0x100000,
+            &pe,
+            &CallRedirects::none(),
+        )
+        .unwrap();
+        let decoded: Vec<_> = iced_x86::Decoder::with_ip(64, &emitted.bytes, 0x100000, 0)
+            .into_iter()
+            .collect();
+        assert_eq!(
+            decoded.last().unwrap().op0_register(),
+            ireg(target_reg, Width::W64)
+        );
+        assert_eq!(
+            decoded
+                .iter()
+                .filter(|i| i.mnemonic() == iced_x86::Mnemonic::Call)
+                .count(),
+            1
+        );
+        if let Some(dir) = std::env::var_os("TVM_TAIL_FIXTURE_DIR") {
+            let dir = std::path::PathBuf::from(dir);
+            let name = if narrow_args {
+                "callret_narrow"
+            } else {
+                "callret_simple"
+            };
+            std::fs::write(dir.join(format!("{name}.bin")), emitted.bytes).unwrap();
+            std::fs::write(dir.join(format!("{name}.json")),format!("{{\"kind\":\"{name}\",\"base\":1048576,\"helper\":1069056,\"narrow_args\":{narrow_args},\"target_reg\":\"{}\"}}",target_reg.name())).unwrap();
+        }
+    }
 }
 
 fn seg(item: Item, reg: Reg) -> Segment {
@@ -839,6 +1304,7 @@ fn a_fused_comparison_uses_the_operand_width() {
         instrs: Vec::new(),
         exits: Vec::new(),
         callee_set: Vec::new(),
+        indirect_tail: None,
         control: Some(Operand::Val(v)),
         terminator: Terminator::Branch {
             predicate,
@@ -991,6 +1457,7 @@ fn a_boundary_move_does_not_clobber_the_compared_register() {
         // boolean return value did.
         exits: vec![(Reg::Rax, Operand::Frame(0))],
         callee_set: Vec::new(),
+        indirect_tail: None,
         control: Some(Operand::Val(v)),
         terminator: Terminator::Branch {
             predicate,
@@ -1357,6 +1824,7 @@ fn a_fused_comparison_on_an_entry_register_names_that_register() {
         ],
         exits: vec![(Reg::Rbx, Operand::Val(ValId(1)))],
         callee_set: Vec::new(),
+        indirect_tail: None,
         control: Some(Operand::Val(ValId(2))),
         terminator: Terminator::Branch {
             predicate,
@@ -1592,6 +2060,7 @@ fn a_narrow_control_value_is_tested_at_its_own_width() {
         }],
         exits: Vec::new(),
         callee_set: Vec::new(),
+        indirect_tail: None,
         control: Some(Operand::Val(v)),
         terminator: Terminator::Branch {
             predicate,
@@ -1865,6 +2334,36 @@ fn two_labels_need_an_instruction_between_them() {
 /// A boxed instruction's implicit register reads are materialized before it.
 /// Fixed inputs such as CPUID's EAX/ECX and string instructions' RDI/RCX/AL cannot
 /// be rewritten in the original encoding.
+#[test]
+fn boxed_rsp_relative_movss_relocates_the_address_without_moving_host_rsp() {
+    let instrs = [Instr::Boxed {
+        site: 0x2000,
+        text: "movss [rsp+70h],xmm0".into(),
+        bytes: vec![0xf3, 0x0f, 0x11, 0x44, 0x24, 0x70],
+        mem: Some(sched::BoxedMemOp { addr: Operand::Frame(-0x48), bytes: 4, writes: true }),
+        uses: Vec::new(),
+    }];
+    let text = text_of(&instrs, &Alloc::default(), &FrameLayout::new(-0xb8, 0, false));
+    assert!(text.iter().any(|t| t.starts_with("movss")), "{text:?}");
+    assert!(text.iter().any(|t| t.starts_with("lea") && t.contains("rsp")), "{text:?}");
+    assert!(!text.iter().any(|t| t.starts_with("lea rsp") || t.starts_with("mov rsp")), "{text:?}");
+}
+
+#[test]
+fn boxed_real_rsp_data_and_implicit_stack_effects_are_rejected() {
+    for (bytes, mem) in [
+        (vec![0x66, 0x0f, 0x6e, 0xc4], None), // movd xmm0,esp
+        (vec![0xff, 0x74, 0x24, 0x08], Some(sched::BoxedMemOp { addr: Operand::Frame(8), bytes: 8, writes: false })), // push [rsp+8]
+        (vec![0x48, 0x89, 0x24, 0x24], Some(sched::BoxedMemOp { addr: Operand::Frame(0), bytes: 8, writes: true })), // mov [rsp],rsp
+    ] {
+        let instr = Instr::Boxed { site: 0x2000, text: "RSP data/stack fixture".into(), bytes, mem, uses: Vec::new() };
+        let mut asm = CodeAssembler::new(64).unwrap();
+        let err = emit_instr(&mut asm, &Alloc::default(), &instr, 0, &FrameLayout::new(-0xb8, 0, false), ImageRange::none(), None, &CallRedirects::none()).unwrap_err();
+        assert!(err.to_string().contains("unsupported guest RSP"), "{err}");
+        assert!(asm.instructions().is_empty(), "rejection must precede RSP materialization");
+    }
+}
+
 #[test]
 fn a_boxed_instructions_implicit_reads_are_materialized() {
     let (leaf, sub) = (ValId(0), ValId(1));

@@ -158,6 +158,29 @@ pub(crate) fn emit_restores(asm: &mut CodeAssembler, layout: &FrameLayout) -> Re
 }
 
 /// Emit the block's exit. A jump to `next` is omitted so control falls through.
+/// Windows' epilogue scanner requires REX.W on non-RIP-relative indirect tail
+/// jumps, even though hardware and iced's default encoder do not.
+pub(crate) fn emit_rex_w_tail_jump(
+    asm: &mut CodeAssembler,
+    base: Reg,
+    displacement: Option<i32>,
+) -> Result<()> {
+    let mut one = CodeAssembler::new(64)?;
+    if let Some(disp) = displacement {
+        one.jmp(qword_ptr(qreg(base) + disp))?;
+    } else {
+        one.jmp(qreg(base))?;
+    }
+    let mut bytes = one.assemble(0)?;
+    if (0x40..=0x4f).contains(&bytes[0]) {
+        bytes[0] |= 8;
+    } else {
+        bytes.insert(0, 0x48);
+    }
+    asm.db(&bytes)?;
+    Ok(())
+}
+
 pub(crate) fn emit_terminator(
     asm: &mut CodeAssembler,
     alloc: &Alloc,
@@ -243,6 +266,60 @@ pub(crate) fn emit_terminator(
                 asm.add(rsp, layout.frame_size as i32)?;
             }
             asm.jmp(redirect.resolve(*target as u64))?;
+        }
+        Terminator::IndirectTailCall { .. } => {
+            // The scheduler leaves the final load for JMP itself. Use a proven
+            // final register containing its address, rather than borrowing R11
+            // (which may be an observable exit value) or reading a dead frame
+            // slot below RSP after teardown (Windows has no red zone).
+            let kind = b
+                .indirect_tail
+                .ok_or_else(|| anyhow::anyhow!("indirect tail call has no proven transfer form"))?;
+            let address = b.control.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("indirect tail call has no scheduled target/address")
+            })?;
+            if b.fused_cmp.is_some() {
+                bail!("indirect tail target was incorrectly fused as a comparison");
+            }
+            let base = b
+                .exits
+                .iter()
+                .find_map(|(reg, value)| {
+                    if value != address || matches!(reg, Reg::Rsp | Reg::Rbp | Reg::R13) {
+                        return None;
+                    }
+                    if matches!(kind, sched::IndirectTailKind::Register)
+                        && !regalloc::VOLATILE.contains(reg)
+                    {
+                        return None;
+                    }
+                    // RBP/R13 remain outside this initial register selection.
+                    // Restoring a nonvolatile register may also replace the desired
+                    // value: accept it only when that value is its original self.
+                    if layout.saves().contains(reg)
+                        && !matches!(value, Operand::Entry(r) if r == reg)
+                    {
+                        return None;
+                    }
+                    Some(*reg)
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "indirect tail call has no preserved register for terminal load address"
+                    )
+                })?;
+            emit_moves(asm, &strip_rsp(moves), layout)?;
+            emit_restores(asm, layout)?;
+            if layout.frame_size > 0 {
+                asm.add(rsp, layout.frame_size as i32)?;
+            }
+            // No instruction after teardown reads the private frame or changes
+            // the caller's return address. Callee stack arguments stay in place.
+            let displacement = match kind {
+                sched::IndirectTailKind::Register => None,
+                sched::IndirectTailKind::Memory { displacement } => Some(displacement),
+            };
+            emit_rex_w_tail_jump(asm, base, displacement)?;
         }
         Terminator::Branch {
             taken, not_taken, ..

@@ -245,6 +245,57 @@ pub struct Node {
     pub width: Width,
 }
 
+/// How an [`Arena`] is distributed across node kinds, widths and in-edges.
+#[derive(Debug, Clone, Default)]
+pub struct Composition {
+    pub total: usize,
+    /// Node count per kind, largest first.
+    pub by_kind: Vec<(String, usize)>,
+    /// Node count per bit width, largest first.
+    pub by_width: Vec<(String, usize)>,
+    /// Total parent edges. A tree of `total` nodes has `total - 1`; anything much
+    /// larger means nodes are reused rather than rebuilt.
+    pub edges: usize,
+    /// Nodes with two or more parents.
+    pub shared: usize,
+    pub max_indegree: usize,
+    /// The most-referenced nodes, rendered shallowly, with their in-degrees.
+    pub top_shared: Vec<(String, usize)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum NodeKind {
+    Const,
+    InitReg,
+    Load,
+    Bin(BinOp),
+    Un(UnOp),
+    Zext,
+    Sext,
+    Trunc,
+    Select,
+    Opaque(&'static str),
+    Param,
+}
+
+impl NodeKind {
+    fn label(self) -> String {
+        match self {
+            Self::Const => "const".to_string(),
+            Self::InitReg => "init_reg".to_string(),
+            Self::Load => "load".to_string(),
+            Self::Bin(op) => format!("bin:{}", op.symbol()),
+            Self::Un(op) => format!("un:{op:?}"),
+            Self::Zext => "zext".to_string(),
+            Self::Sext => "sext".to_string(),
+            Self::Trunc => "trunc".to_string(),
+            Self::Select => "select".to_string(),
+            Self::Opaque(tag) => format!("opaque:{tag}"),
+            Self::Param => "param".to_string(),
+        }
+    }
+}
+
 /// Hash-consing arena. All expression construction goes through here so that
 /// structural equality is pointer equality. Cloning omits memo caches because they
 /// are derived from immutable nodes.
@@ -315,6 +366,107 @@ impl Clone for Arena {
 impl Arena {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// How the arena is distributed, for diagnosing runaway growth.
+    ///
+    /// Counting by node kind says where the mass is. Counting in-edges says whether that
+    /// mass is *shared* or *duplicated*, which is the difference between an expression
+    /// that is merely large and one that has been rebuilt from scratch at every step.
+    pub fn composition(&self) -> Composition {
+        let n = self.nodes.len();
+        let mut indeg = vec![0u32; n];
+        let mut kinds: std::collections::HashMap<NodeKind, usize> =
+            std::collections::HashMap::new();
+        let mut widths: std::collections::HashMap<&'static str, usize> =
+            std::collections::HashMap::new();
+        for node in &self.nodes {
+            let kind = match &node.op {
+                Op::Const(_) => NodeKind::Const,
+                Op::InitReg(_) => NodeKind::InitReg,
+                Op::Load(_, _) => NodeKind::Load,
+                Op::Bin(op, _, _) => NodeKind::Bin(*op),
+                Op::Un(op, _) => NodeKind::Un(*op),
+                Op::Zext(_) => NodeKind::Zext,
+                Op::Sext(_) => NodeKind::Sext,
+                Op::Trunc(_) => NodeKind::Trunc,
+                Op::Select(_, _, _) => NodeKind::Select,
+                Op::Opaque(tag, _) => NodeKind::Opaque(tag),
+                Op::Param(_, _) => NodeKind::Param,
+            };
+            *kinds.entry(kind).or_default() += 1;
+            *widths
+                .entry(match node.width {
+                    Width::W8 => "w8",
+                    Width::W16 => "w16",
+                    Width::W32 => "w32",
+                    Width::W64 => "w64",
+                })
+                .or_default() += 1;
+            let mut bump = |r: Ref| {
+                if let Some(slot) = indeg.get_mut(r.index()) {
+                    *slot += 1;
+                }
+            };
+            match &node.op {
+                Op::Bin(_, x, y) => {
+                    bump(*x);
+                    bump(*y);
+                }
+                Op::Un(_, x) | Op::Zext(x) | Op::Sext(x) | Op::Trunc(x) => bump(*x),
+                Op::Load(a, _) => bump(*a),
+                Op::Select(c, x, y) => {
+                    bump(*c);
+                    bump(*x);
+                    bump(*y);
+                }
+                _ => {}
+            }
+        }
+
+        // The most-referenced nodes, rendered shallowly: a subtree that half the DAG
+        // points at is the thing a rewrite would have to share or eliminate.
+        let mut by_indeg: Vec<(usize, u32)> = Vec::with_capacity(6);
+        for (index, degree) in indeg.iter().copied().enumerate().filter(|(_, d)| *d >= 2) {
+            if by_indeg.len() < 6 {
+                by_indeg.push((index, degree));
+                continue;
+            }
+            let (smallest, _) = by_indeg
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (index, degree))| (*degree, std::cmp::Reverse(*index)))
+                .unwrap();
+            if degree > by_indeg[smallest].1 {
+                by_indeg[smallest] = (index, degree);
+            }
+        }
+        by_indeg.sort_by_key(|(index, degree)| (std::cmp::Reverse(*degree), *index));
+        let top_shared: Vec<(String, usize)> = by_indeg
+            .into_iter()
+            .map(|(index, degree)| (render(self, Ref::from_index(index), 3), degree as usize))
+            .collect();
+
+        let mut by_kind: Vec<(String, usize)> = kinds
+            .into_iter()
+            .map(|(kind, count)| (kind.label(), count))
+            .collect();
+        by_kind.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let mut by_width: Vec<(String, usize)> = widths
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        by_width.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+
+        Composition {
+            total: n,
+            by_kind,
+            by_width,
+            edges: indeg.iter().map(|v| *v as usize).sum(),
+            shared: indeg.iter().filter(|v| **v >= 2).count(),
+            max_indegree: indeg.iter().copied().max().unwrap_or(0) as usize,
+            top_shared,
+        }
     }
 
     /// Number of distinct nodes reachable from the roots, following operand edges.
@@ -1109,6 +1261,15 @@ impl Arena {
                 if cb == Some(0) {
                     return Some(a);
                 }
+                // Collect equal terms modulo the operand width: q + 4*q
+                // becomes 5*q, and 5*q + 5*q becomes 10*q. TVM obscures
+                // remainder indices using precisely these additive products.
+                let (x, cx) = self.constant_factor(a);
+                let (y, cy) = self.constant_factor(b);
+                if x == y && self.width(x) == width {
+                    let coefficient = self.constant(cx.wrapping_add(cy), width);
+                    return Some(self.bin(BinOp::Mul, x, coefficient));
+                }
                 // x + (-x) == 0, x + ~x == -1
                 if let Op::Un(UnOp::Neg, inner) = *self.op(b) {
                     if inner == a {
@@ -1197,6 +1358,19 @@ impl Arena {
                 if a == b {
                     return Some(self.constant(0, width));
                 }
+                // x - (x /u d) * d == x %u d for nonzero d. The quotient
+                // can come from a proven reciprocal-multiply division below.
+                if let Some((BinOp::Mul, quotient, coefficient)) = self.as_bin(b) {
+                    if let Some((BinOp::UDiv, dividend, divisor)) = self.as_bin(quotient) {
+                        if dividend == a
+                            && self.width(dividend) == width
+                            && self.as_const(divisor).is_some_and(|d| d != 0)
+                            && self.as_const(divisor) == self.as_const(coefficient)
+                        {
+                            return Some(self.bin(BinOp::URem, dividend, divisor));
+                        }
+                    }
+                }
                 // (A|B) - (A&B) == A ^ B
                 if let (Some((BinOp::Or, x1, y1)), Some((BinOp::And, x2, y2))) =
                     (self.as_bin(a), self.as_bin(b))
@@ -1212,6 +1386,16 @@ impl Arena {
                     }
                     if y == b {
                         return Some(x);
+                    }
+                }
+                // A - (A + B) == -B, in either addend order. This also
+                // collapses flag tests such as A & (A - (A + constant)).
+                if let Some((BinOp::Add, x, y)) = self.as_bin(b) {
+                    if x == a && self.width(y) == width {
+                        return Some(self.un(UnOp::Neg, y));
+                    }
+                    if y == a && self.width(x) == width {
+                        return Some(self.un(UnOp::Neg, x));
                     }
                 }
                 // A - (A & B) == A & ~B Exact rather than approximate: `A & B` has no bit set that `A` does not, so the subtraction can never borrow and is the same as clearing those bits.
@@ -1352,6 +1536,19 @@ impl Arena {
                         _ => {}
                     }
                 }
+                // (A ^ B) & (A | B) == A ^ B: every XOR bit is already
+                // present in the union. This exposes TVM's obfuscated 5*q
+                // term before reciprocal-division remainder recognition.
+                if let (Some((o1, x1, y1)), Some((o2, x2, y2))) = (self.as_bin(a), self.as_bin(b)) {
+                    if same_pair(x1, y1, x2, y2) {
+                        if o1 == BinOp::Xor && o2 == BinOp::Or {
+                            return Some(a);
+                        }
+                        if o2 == BinOp::Xor && o1 == BinOp::Or {
+                            return Some(b);
+                        }
+                    }
+                }
                 // A & (A ^ B) == A & ~B   (and the same with the XOR's arms swapped). Where A is clear both sides are clear; where A is set the XOR yields `~B`.
                 for (p, q) in [(a, b), (b, a)] {
                     if let Some((BinOp::Xor, x, y)) = self.as_bin(q) {
@@ -1440,6 +1637,18 @@ impl Arena {
                             if self.is_complement(neg, p) {
                                 return Some(self.bin(BinOp::Or, p, other));
                             }
+                        }
+                    }
+                }
+                // (A | B) | (A & B) == A | B. This is the dual
+                // absorption TVM uses while spelling multiplication by five.
+                if let (Some((o1, x1, y1)), Some((o2, x2, y2))) = (self.as_bin(a), self.as_bin(b)) {
+                    if same_pair(x1, y1, x2, y2) {
+                        if o1 == BinOp::Or && o2 == BinOp::And {
+                            return Some(a);
+                        }
+                        if o2 == BinOp::Or && o1 == BinOp::And {
+                            return Some(b);
                         }
                     }
                 }
@@ -1658,13 +1867,17 @@ impl Arena {
                 if self.is_complement(a, b) {
                     return Some(self.constant(mask, width));
                 }
-                // (A | c1) ^ c2 where c1 & c2 == c1 -> A ^ (c1 ^ c2)
-                // This helps flatten nested constants in XOR chains
+                // (A | c1) ^ c2 == (A & ~c1) ^ (c1 ^ c2).
+                // Bits forced by c1 must be cleared from A before folding the
+                // constants. Omitting the mask is only valid when those bits
+                // were already zero in A.
                 if let (Some(c2), Some((BinOp::Or, x, y))) = (cb, self.as_bin(a)) {
                     if let Some(c1) = self.as_const(y) {
                         if (c1 & c2) == c1 {
+                            let keep = self.constant(!c1, width);
+                            let masked = self.bin(BinOp::And, x, keep);
                             let k = self.constant(c1 ^ c2, width);
-                            return Some(self.bin(BinOp::Xor, x, k));
+                            return Some(self.bin(BinOp::Xor, masked, k));
                         }
                     }
                 }
@@ -1711,6 +1924,16 @@ impl Arena {
                 None
             }
 
+            BinOp::MulHiS | BinOp::MulHiU => {
+                // Both halves of x * 0 are zero, for signed and unsigned
+                // multiplication. Retaining x here creates spurious SSA uses
+                // when a VM temporary survives across a join.
+                if cb == Some(0) {
+                    return Some(self.constant(0, width));
+                }
+                None
+            }
+
             BinOp::Mul => {
                 if cb == Some(0) {
                     return Some(self.constant(0, width));
@@ -1718,10 +1941,32 @@ impl Arena {
                 if cb == Some(1) {
                     return Some(a);
                 }
+                if let (Some(c2), Some((BinOp::Mul, x, k1))) = (cb, self.as_bin(a)) {
+                    if self.width(a) == width {
+                        if let Some(c1) = self.as_const(k1) {
+                            let k = self.constant(c1.wrapping_mul(c2), width);
+                            return Some(self.bin(BinOp::Mul, x, k));
+                        }
+                    }
+                }
                 None
             }
 
             BinOp::Shl | BinOp::Shr | BinOp::Sar | BinOp::Rol | BinOp::Ror => {
+                if op == BinOp::Shr && self.width(a) == width {
+                    if let (Some(shift), Some((BinOp::MulHiU, x, multiplier))) =
+                        (cb, self.as_bin(a))
+                    {
+                        if let Some(m) = self.as_const(multiplier) {
+                            if self.width(x) == width {
+                                if let Some(d) = reciprocal_divisor(m, shift & 63, width) {
+                                    let divisor = self.constant(d, width);
+                                    return Some(self.bin(BinOp::UDiv, x, divisor));
+                                }
+                            }
+                        }
+                    }
+                }
                 if cb == Some(0) {
                     return Some(a);
                 }
@@ -1731,6 +1976,14 @@ impl Arena {
             BinOp::Eq => {
                 if a == b {
                     return Some(self.constant(1, Width::W8));
+                }
+                // One provably differing bit is enough to disprove equality.
+                // Use the operands' width: comparisons themselves are W8.
+                let operand_mask = self.width(a).max(self.width(b)).mask();
+                let different = (self.known_one(a) & self.known_zero(b))
+                    | (self.known_zero(a) & self.known_one(b));
+                if different & operand_mask != 0 {
+                    return Some(self.constant(0, Width::W8));
                 }
                 None
             }
@@ -1744,6 +1997,19 @@ impl Arena {
 
             _ => None,
         }
+    }
+
+    /// Return the base and constant coefficient of one product, or the
+    /// expression itself with coefficient one. No widening is moved across.
+    fn constant_factor(&self, r: Ref) -> (Ref, u64) {
+        if let Some((BinOp::Mul, x, k)) = self.as_bin(r) {
+            if self.width(x) == self.width(r) {
+                if let Some(c) = self.as_const(k) {
+                    return (x, c);
+                }
+            }
+        }
+        (r, 1)
     }
 
     pub fn as_bin(&self, r: Ref) -> Option<(BinOp, Ref, Ref)> {
@@ -1893,6 +2159,15 @@ impl Arena {
                         let n = ka.trailing_ones().saturating_add(kb.trailing_ones());
                         mask_of_low_bits(n.min(64))
                     }
+                    BinOp::URem => match self.as_const(b) {
+                        Some(d) if d != 0 => {
+                            // A remainder is at most d-1; bits above the
+                            // highest possible set bit are provably zero.
+                            let bits = 64 - (d - 1).leading_zeros();
+                            !mask_of_low_bits(bits)
+                        }
+                        _ => 0,
+                    },
                     BinOp::Ult | BinOp::Slt | BinOp::Eq => !1u64,
                     _ => 0,
                 }
@@ -2032,6 +2307,25 @@ pub fn is_guest_rooted(a: &Arena, r: Ref) -> bool {
     leaves(a, r)
         .iter()
         .any(|l| matches!(a.op(*l), Op::Param(..) | Op::InitReg(_)))
+}
+
+/// Prove a round-up reciprocal division for the entire unsigned domain.
+/// Let scale = 2^(n+s), m*d = scale+e. Then x*m/scale is
+/// x/d + x*e/(d*scale). If e*(2^n-1) < scale, the error is less
+/// than 1/d, so it cannot cross the next quotient for any remainder.
+/// This sufficient condition deliberately rejects harder magic sequences.
+fn reciprocal_divisor(multiplier: u64, shift: u64, width: Width) -> Option<u64> {
+    if multiplier == 0 || shift >= width.bits() as u64 {
+        return None;
+    }
+    let scale = 1u128.checked_shl(width.bits() + shift as u32)?;
+    let m = multiplier as u128;
+    let d = scale / m + u128::from(scale % m != 0);
+    if d == 0 || d > width.mask() as u128 {
+        return None;
+    }
+    let error = m.checked_mul(d)?.checked_sub(scale)?;
+    (error.checked_mul(width.mask() as u128)? < scale).then_some(d as u64)
 }
 
 /// The aligned 8-byte cells covering `[addr, addr + bytes)`.
@@ -2234,6 +2528,70 @@ pub fn render(a: &Arena, r: Ref, max_depth: u32) -> String {
     let mut s = String::new();
     go(a, r, 0, max_depth, &mut s);
     s
+}
+
+#[cfg(test)]
+mod composition_tests {
+    use super::*;
+
+    /// Sharing is what the in-edge counts are for: a DAG that reuses a subtree has
+    /// more edges than a tree of the same size, and the diagnostic has to show that,
+    /// because it is the difference between a large expression and a rebuilt one.
+    #[test]
+    fn a_shared_subtree_shows_up_as_extra_edges() {
+        let mut a = Arena::new();
+        let x = a.init_reg(Reg::Rax);
+        let one = a.constant(1, Width::W64);
+        // Two parents for the same node.
+        let s = a.bin(BinOp::Add, x, one);
+        let t = a.bin(BinOp::Xor, x, one);
+        let top = a.bin(BinOp::Or, s, t);
+        let c = a.composition();
+
+        assert_eq!(c.total, a.len());
+        assert_eq!(c.total, 5, "x, 1, add, xor, or");
+        assert!(
+            c.edges > c.total - 1,
+            "edges {} vs tree {}",
+            c.edges,
+            c.total - 1
+        );
+        // Only the two leaves have two parents; the three bin nodes have one each.
+        assert_eq!(c.shared, 2);
+        assert_eq!(c.max_indegree, 2);
+        let kinds: Vec<&str> = c.by_kind.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(kinds.contains(&"bin:+"), "{kinds:?}");
+        assert!(kinds.contains(&"init_reg"), "{kinds:?}");
+        assert!(!c.top_shared.is_empty(), "a shared node must be listed");
+        let _ = top;
+    }
+
+    /// Reachability is what separates nodes still in use from nodes merely still
+    /// allocated, which is the distinction the folding limit should be measuring.
+    #[test]
+    fn reachability_ignores_nodes_nothing_points_at() {
+        let mut a = Arena::new();
+        let x = a.init_reg(Reg::Rax);
+        let one = a.constant(1, Width::W64);
+        let live = a.bin(BinOp::Add, x, one);
+        // The shape a clobber-on-every-step machine produces: allocated, unreferenced.
+        let _dead = a.opaque("clobbered", Width::W64);
+        let _dead2 = a.opaque("flag", Width::W8);
+        assert_eq!(a.len(), 5);
+        assert_eq!(a.reachable_from(&[live]), 3, "x, 1 and the add");
+        assert_eq!(a.reachable_from(&[]), 0);
+    }
+
+    /// A degenerate arena still reports a coherent composition rather than panicking.
+    #[test]
+    fn an_empty_arena_is_described() {
+        let a = Arena::new();
+        let c = a.composition();
+        assert_eq!(c.total, 0);
+        assert_eq!(c.edges, 0);
+        assert_eq!(c.shared, 0);
+        assert!(c.by_kind.is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -2776,10 +3134,10 @@ mod tests {
         let y = a.init_reg(Reg::Rbx);
         let sum = a.bin(BinOp::Add, x, y);
 
-        // Retaining `y` first deliberately reverses the two leaf indices in
-        // the compacted arena. The existing sum must follow the new canonical
-        // Ref order or a later construction of the same expression will no
-        // longer hash-cons to it.
+        // Retaining `y` first changes the DFS visitation order without changing
+        // the old Ref order. Compaction must preserve that relative ordering or
+        // a later construction of the same expression will not hash-cons to
+        // the retained sum.
         let remap = a.compact(&[y, sum]);
         let rebuilt = a.bin(BinOp::Add, remap[&x], remap[&y]);
 
@@ -3533,6 +3891,306 @@ mod vmctx_addr_tests {
             "dead flag terms (PF<<2, AF<<4, 0x2) should be stripped; \
              got: {}",
             render(&a, result, 24),
+        );
+    }
+}
+
+#[cfg(test)]
+mod symbolic_dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn xor_of_forced_bits_preserves_clearing_semantics() {
+        // Evaluate independently, including inputs that set the OR's mask.
+        // The old rewrite (x|c1)^c2 -> x^(c1^c2) fails for x=c1.
+        for width in [Width::W8, Width::W16, Width::W32, Width::W64] {
+            let mut a = Arena::new();
+            let reg = a.init_reg(Reg::Rax);
+            let x = a.trunc(reg, width);
+            for (c1, c2) in [(0x46, 0x56), (0xf0, 0xff), (1, 3), (0x80, 0x80)] {
+                let k1 = a.constant(c1, width);
+                let k2 = a.constant(c2, width);
+                let forced = a.bin(BinOp::Or, x, k1);
+                let got = a.bin(BinOp::Xor, forced, k2);
+                for value in 0..=255u64 {
+                    let env = HashMap::from([(Reg::Rax, value)]);
+                    assert_eq!(
+                        tests::eval(&a, got, &env),
+                        ((value | c1) ^ c2) & width.mask()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn equality_uses_high_known_bits_and_leaves_unknown_bits_symbolic() {
+        let mut a = Arena::new();
+        let x = a.init_reg(Reg::Rax);
+        let high = a.constant(0xffff_f780, Width::W64);
+        let forced = a.bin(BinOp::Or, x, high);
+        let zero = a.constant(0, Width::W64);
+        let impossible = a.bin(BinOp::Eq, forced, zero);
+        assert_eq!(a.as_const(impossible), Some(0));
+        let possible = a.bin(BinOp::Eq, forced, high);
+        assert!(a.as_const(possible).is_none());
+        for value in [0, 1, 0xffff_f780, u64::MAX] {
+            let env = HashMap::from([(Reg::Rax, value)]);
+            assert_eq!(
+                tests::eval(&a, possible, &env),
+                ((value | 0xffff_f780) == 0xffff_f780) as u64
+            );
+        }
+    }
+
+    #[test]
+    fn undefined_af_cancels_from_observed_dispatch_predicate() {
+        // Observed in ACE's handler 0x183f267b1: ((AF<<4)|0x46)
+        // & (same - (same - 0x40)) == 0. The fixed bit 6 decides it;
+        // no architecture-specific value may be assigned to undefined AF.
+        let mut a = Arena::new();
+        let af = a.undef("af_undef", Width::W8);
+        let wide = a.zext(af, Width::W32);
+        let one = a.constant(1, Width::W32);
+        let bit = a.bin(BinOp::And, wide, one);
+        let four = a.constant(4, Width::W32);
+        let shifted = a.bin(BinOp::Shl, bit, four);
+        let fixed = a.constant(0x46, Width::W32);
+        let flags = a.bin(BinOp::Or, shifted, fixed);
+        let bias = a.constant(0xffff_ffc0, Width::W32);
+        let displaced = a.bin(BinOp::Add, flags, bias);
+        let difference = a.bin(BinOp::Sub, flags, displaced);
+        assert_eq!(a.as_const(difference), Some(0x40));
+        let tested = a.bin(BinOp::And, flags, difference);
+        let zero = a.constant(0, Width::W32);
+        let predicate = a.bin(BinOp::Eq, tested, zero);
+        assert_eq!(a.as_const(predicate), Some(0));
+    }
+
+    #[test]
+    fn subtract_sum_cancellation_matches_wrapping_arithmetic() {
+        for width in [Width::W8, Width::W16, Width::W32, Width::W64] {
+            let mut a = Arena::new();
+            let rx = a.init_reg(Reg::Rax);
+            let ry = a.init_reg(Reg::Rcx);
+            let x = a.trunc(rx, width);
+            let y = a.trunc(ry, width);
+            let sum = a.bin(BinOp::Add, x, y);
+            let got = a.bin(BinOp::Sub, x, sum);
+            for vx in [0, 1, 127, 255, width.mask()] {
+                for vy in [0, 1, 127, 255, width.mask()] {
+                    let env = HashMap::from([(Reg::Rax, vx), (Reg::Rcx, vy)]);
+                    assert_eq!(
+                        tests::eval(&a, got, &env),
+                        vx.wrapping_sub(vx.wrapping_add(vy)) & width.mask()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod reciprocal_dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn accepted_byte_reciprocals_are_exact_for_every_input() {
+        let mut accepted = 0;
+        for multiplier in 1..=255 {
+            for shift in 0..8 {
+                if let Some(divisor) = reciprocal_divisor(multiplier, shift, Width::W8) {
+                    accepted += 1;
+                    for x in 0..=255 {
+                        assert_eq!(
+                            ((x * multiplier) >> 8) >> shift,
+                            x / divisor,
+                            "m={multiplier} s={shift} d={divisor} x={x}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(accepted > 100);
+    }
+
+    #[test]
+    fn reciprocal_proof_rejects_inexact_divide_by_seven() {
+        // ceil(2^64/7) overestimates the quotient near UINT64_MAX;
+        // the proof must reject it instead of identifying every magic-looking
+        // multiplier with an ordinary division.
+        assert_eq!(
+            reciprocal_divisor(0x2492_4924_9249_2493, 0, Width::W64),
+            None
+        );
+        assert_eq!(reciprocal_divisor(0, 3, Width::W64), None);
+        assert_eq!(reciprocal_divisor(0xcccd, 64, Width::W64), None);
+        assert_eq!(reciprocal_divisor(0xcccc_cccd, 3, Width::W32), Some(10));
+        assert_eq!(
+            reciprocal_divisor(0xcccc_cccc_cccc_cccd, 3, Width::W64),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn observed_decimal_switch_index_reduces_to_remainder() {
+        let mut a = Arena::new();
+        let x = a.init_reg(Reg::Rdx);
+        let magic = a.constant(0xcccc_cccc_cccc_cccd, Width::W64);
+        let high = a.bin(BinOp::MulHiU, x, magic);
+        let three = a.constant(3, Width::W64);
+        let q = a.bin(BinOp::Shr, high, three);
+        assert!(matches!(a.op(q), Op::Bin(BinOp::UDiv, _, _)));
+        let four = a.constant(4, Width::W64);
+        let q4 = a.bin(BinOp::Mul, q, four);
+        let q5 = a.bin(BinOp::Add, q, q4);
+        let q10 = a.bin(BinOp::Add, q5, q5);
+        let remainder = a.bin(BinOp::Sub, x, q10);
+        assert!(matches!(a.op(remainder), Op::Bin(BinOp::URem, _, _)));
+        assert_eq!(!a.known_zero(remainder), 15);
+        let mut inputs = vec![0, 1, 9, 10, 11, 19, 20, u64::MAX, u64::MAX - 1];
+        let mut seed = 0x93a5_712e_ff04_36acu64;
+        for _ in 0..4096 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            inputs.push(seed);
+        }
+        for value in inputs {
+            let env = HashMap::from([(Reg::Rdx, value)]);
+            assert_eq!(tests::eval(&a, q, &env), value / 10);
+            assert_eq!(tests::eval(&a, remainder, &env), value % 10);
+        }
+    }
+
+    #[test]
+    fn constant_factor_collection_respects_modular_width() {
+        for width in [Width::W8, Width::W16, Width::W32, Width::W64] {
+            let mut a = Arena::new();
+            let reg = a.init_reg(Reg::Rax);
+            let x = a.trunc(reg, width);
+            let c1 = a.constant(width.mask() - 3, width);
+            let c2 = a.constant(8, width);
+            let left = a.bin(BinOp::Mul, x, c1);
+            let right = a.bin(BinOp::Mul, x, c2);
+            let sum = a.bin(BinOp::Add, left, right);
+            for value in [0, 1, 9, 127, 128, 255, width.mask()] {
+                let env = HashMap::from([(Reg::Rax, value)]);
+                assert_eq!(
+                    tests::eval(&a, sum, &env),
+                    value.wrapping_mul(4) & width.mask()
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod mba_switch_tests {
+    use super::*;
+
+    #[test]
+    fn xor_intersection_union_matches_every_byte_pair() {
+        let mut a = Arena::new();
+        let rx = a.init_reg(Reg::Rax);
+        let ry = a.init_reg(Reg::Rcx);
+        let x = a.trunc(rx, Width::W8);
+        let y = a.trunc(ry, Width::W8);
+        let xor = a.bin(BinOp::Xor, x, y);
+        let union = a.bin(BinOp::Or, x, y);
+        let got = a.bin(BinOp::And, xor, union);
+        assert_eq!(got, xor);
+        for vx in 0..=255 {
+            for vy in 0..=255 {
+                let env = HashMap::from([(Reg::Rax, vx), (Reg::Rcx, vy)]);
+                assert_eq!(tests::eval(&a, got, &env), (vx ^ vy) & (vx | vy));
+            }
+        }
+    }
+
+    #[test]
+    fn observed_obfuscated_remainder_reduces_exactly() {
+        let mut a = Arena::new();
+        let x = a.init_reg(Reg::Rdx);
+        let ten = a.constant(10, Width::W64);
+        let q = a.bin(BinOp::UDiv, x, ten);
+        let four = a.constant(4, Width::W64);
+        let q4 = a.bin(BinOp::Mul, q, four);
+        let xor = a.bin(BinOp::Xor, q, q4);
+        let union = a.bin(BinOp::Or, q, q4);
+        let filtered = a.bin(BinOp::And, xor, union);
+        let left = a.bin(BinOp::Or, q4, filtered);
+        let common = a.bin(BinOp::And, q, q4);
+        let redundant = a.bin(BinOp::Or, left, common);
+        let difference = a.bin(BinOp::Sub, redundant, left);
+        let right = a.bin(BinOp::Or, common, difference);
+        let q5 = a.bin(BinOp::Add, left, right);
+        let q10 = a.bin(BinOp::Add, q5, q5);
+        let got = a.bin(BinOp::Sub, x, q10);
+        let want = a.bin(BinOp::URem, x, ten);
+        assert_eq!(got, want, "{}", render(&a, got, 15));
+    }
+}
+
+#[cfg(test)]
+mod high_product_tests {
+    use super::*;
+
+    #[test]
+    fn zero_high_products_preserve_all_widths_and_signedness() {
+        for width in [Width::W8, Width::W16, Width::W32, Width::W64] {
+            let mut arena = Arena::new();
+            let reg = arena.init_reg(Reg::Rax);
+            let x = arena.trunc(reg, width);
+            let zero = arena.constant(0, width);
+            for op in [BinOp::MulHiS, BinOp::MulHiU] {
+                for (left, right) in [(x, zero), (zero, x)] {
+                    let high = arena.bin(op, left, right);
+                    assert_eq!(arena.as_const(high), Some(0));
+                    assert_eq!(arena.width(high), width);
+                    for value in [0, 1, 127, 128, 255, width.mask() >> 1, width.mask()] {
+                        assert_eq!(fold_bin(op, value, 0, width), Some(0));
+                        assert_eq!(fold_bin(op, 0, value, width), Some(0));
+                    }
+                }
+            }
+            // Multiplication by one is not the same identity: a negative signed
+            // operand sign-extends into the high half, while an unsigned one does not.
+            let one = arena.constant(1, width);
+            let signed = arena.bin(BinOp::MulHiS, x, one);
+            let unsigned = arena.bin(BinOp::MulHiU, x, one);
+            let env = HashMap::from([(Reg::Rax, width.mask())]);
+            assert_eq!(tests::eval(&arena, signed, &env), width.mask());
+            assert_eq!(tests::eval(&arena, unsigned, &env), 0);
+        }
+    }
+
+    #[test]
+    fn zero_high_product_removes_observed_foreign_call_argument_dependency() {
+        let mut arena = Arena::new();
+        let foreign = arena.param(BlockRef(5), Reg::Rax);
+        let zero64 = arena.constant(0, Width::W64);
+        let high = arena.bin(BinOp::MulHiS, foreign, zero64);
+        let shift18 = arena.constant(18, Width::W64);
+        let quotient = arena.bin(BinOp::Sar, high, shift18);
+        let shift63 = arena.constant(63, Width::W64);
+        let sign = arena.bin(BinOp::Shr, quotient, shift63);
+        let adjusted = arena.bin(BinOp::Add, quotient, sign);
+        let adjusted32 = arena.trunc(adjusted, Width::W32);
+        let address = arena.constant(0x7fff_fffefdd0, Width::W64);
+        let loaded = arena.load(address, Width::W32);
+        let difference = arena.bin(BinOp::Sub, loaded, adjusted32);
+        let zero32 = arena.constant(0, Width::W32);
+        let is_zero = arena.bin(BinOp::Eq, loaded, zero32);
+        let one8 = arena.constant(1, Width::W8);
+        let nonzero = arena.bin(BinOp::Xor, is_zero, one8);
+        let selected = arena.select(nonzero, difference, zero32);
+        let call_argument = arena.zext(selected, Width::W64);
+        assert_eq!(difference, loaded);
+        assert!(
+            leaves(&arena, call_argument)
+                .iter()
+                .all(|&leaf| !matches!(arena.op(leaf), Op::Param(..)))
         );
     }
 }

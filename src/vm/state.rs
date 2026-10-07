@@ -1,6 +1,6 @@
 //! Abstract machine state for the guided evaluator. Registers and flags hold [`expr::Ref`]s, so a value is "concrete" exactly when its node is `Op::Const`.
 
-use crate::ir::expr::{Arena, BinOp, Ref, Reg, Width};
+use crate::ir::expr::{Arena, BinOp, Op, Ref, Reg, UnOp, Width};
 use std::collections::HashMap;
 
 /// x86 status flags the lifter models.
@@ -56,6 +56,45 @@ pub enum Byte {
     },
 }
 
+/// Bytes written through one exact symbolic base. A write through any other
+/// base may alias these bytes, so it drops the entire cache. Offsets are modulo
+/// 2^64; the base includes the sign of its one symbolic atom.
+#[derive(Debug, Clone)]
+struct SymbolicMemory {
+    base: Ref,
+    negative: bool,
+    bytes: HashMap<u64, Byte>,
+}
+
+fn symbolic_address(arena: &Arena, mut addr: Ref) -> (Ref, bool, u64) {
+    let mut negative = false;
+    let mut offset = 0u64;
+    while arena.width(addr) == Width::W64 {
+        let (next, add, flip) = match *arena.op(addr) {
+            Op::Bin(BinOp::Add, a, b) => match (arena.as_const(a), arena.as_const(b)) {
+                (Some(c), _) => (b, c, false),
+                (_, Some(c)) => (a, c, false),
+                _ => break,
+            },
+            Op::Bin(BinOp::Sub, a, b) => match (arena.as_const(a), arena.as_const(b)) {
+                (_, Some(c)) => (a, c.wrapping_neg(), false),
+                (Some(c), _) => (b, c, true),
+                _ => break,
+            },
+            Op::Un(UnOp::Neg, a) => (a, 0, true),
+            _ => break,
+        };
+        offset = if negative {
+            offset.wrapping_sub(add)
+        } else {
+            offset.wrapping_add(add)
+        };
+        negative ^= flip;
+        addr = next;
+    }
+    (addr, negative, offset)
+}
+
 #[derive(Debug, Clone)]
 pub struct State {
     pub regs: HashMap<Reg, Ref>,
@@ -65,6 +104,7 @@ pub struct State {
     /// Stores whose address did not fold to a constant. Kept so the lifter can
     /// see that it lost precision instead of silently dropping the store.
     pub sym_stores: Vec<(Ref, Ref, Width)>,
+    symbolic_memory: Option<SymbolicMemory>,
     /// XMM registers, as a low and a high 64-bit half. TVM boxes every SSE instruction, and many are plain 16-byte data moves.
     pub xmm: HashMap<(u8, XmmHalf), Ref>,
 }
@@ -104,6 +144,7 @@ impl State {
             flags,
             mem: HashMap::new(),
             sym_stores: Vec::new(),
+            symbolic_memory: None,
             xmm: HashMap::new(),
         }
     }
@@ -160,6 +201,13 @@ impl State {
             roots.push(*addr);
             roots.push(*value);
         }
+        if let Some(memory) = &self.symbolic_memory {
+            roots.push(memory.base);
+            roots.extend(memory.bytes.values().filter_map(|byte| match byte {
+                Byte::Sym { expr, .. } => Some(*expr),
+                Byte::Const(_) => None,
+            }));
+        }
         roots.extend(self.xmm.values().copied());
         roots
     }
@@ -185,6 +233,14 @@ impl State {
         for (addr, value, _) in &mut self.sym_stores {
             *addr = mapped(*addr);
             *value = mapped(*value);
+        }
+        if let Some(memory) = &mut self.symbolic_memory {
+            memory.base = mapped(memory.base);
+            for byte in memory.bytes.values_mut() {
+                if let Byte::Sym { expr, .. } = byte {
+                    *expr = mapped(*expr);
+                }
+            }
         }
         for value in self.xmm.values_mut() {
             *value = mapped(*value);
@@ -225,6 +281,8 @@ impl State {
 
     /// Store `value` of `width` at a concrete address.
     pub fn store_concrete(&mut self, arena: &Arena, addr: u64, value: Ref, width: Width) {
+        // A constant address is not proved disjoint from a symbolic base.
+        self.forget_symbolic_memory();
         let konst = arena.as_const(value);
         for i in 0..width.bytes() {
             let b = match konst {
@@ -239,9 +297,59 @@ impl State {
     }
 
     pub fn forget_concrete(&mut self, addr: u64, bytes: u32) {
+        self.forget_symbolic_memory();
         for i in 0..bytes {
             self.mem.remove(&addr.wrapping_add(i as u64));
         }
+    }
+
+    /// Lose only symbolic forwarding knowledge at joins, unknown writes or
+    /// guest calls. The diagnostic store history deliberately remains intact.
+    pub fn forget_symbolic_memory(&mut self) {
+        self.symbolic_memory = None;
+    }
+
+    pub fn store_symbolic(&mut self, arena: &Arena, addr: Ref, value: Ref, width: Width) {
+        self.sym_stores.push((addr, value, width));
+        let (base, negative, offset) = symbolic_address(arena, addr);
+        if self
+            .symbolic_memory
+            .as_ref()
+            .is_none_or(|m| m.base != base || m.negative != negative || m.bytes.len() > 65536)
+        {
+            self.symbolic_memory = Some(SymbolicMemory {
+                base,
+                negative,
+                bytes: HashMap::new(),
+            });
+        }
+        let memory = self
+            .symbolic_memory
+            .as_mut()
+            .expect("symbolic cache just initialized");
+        let constant = arena.as_const(value);
+        for i in 0..width.bytes() {
+            let byte = match constant {
+                Some(c) => Byte::Const((c >> (8 * i)) as u8),
+                None => Byte::Sym {
+                    expr: value,
+                    index: i,
+                },
+            };
+            memory.bytes.insert(offset.wrapping_add(i as u64), byte);
+        }
+    }
+
+    pub fn load_symbolic(&self, arena: &mut Arena, addr: Ref, width: Width) -> Option<Ref> {
+        let (base, negative, offset) = symbolic_address(arena, addr);
+        let memory = self.symbolic_memory.as_ref()?;
+        if base != memory.base || negative != memory.negative {
+            return None;
+        }
+        let bytes: Option<Vec<_>> = (0..width.bytes())
+            .map(|i| memory.bytes.get(&offset.wrapping_add(i as u64)).copied())
+            .collect();
+        Self::assemble_bytes(arena, bytes?, width)
     }
 
     /// Load `width` bytes from a concrete address. `image` supplies bytes that
@@ -263,6 +371,10 @@ impl State {
             bytes.push(b);
         }
 
+        Self::assemble_bytes(arena, bytes, width)
+    }
+
+    fn assemble_bytes(arena: &mut Arena, bytes: Vec<Byte>, width: Width) -> Option<Ref> {
         // All constant: fold to an immediate.
         // Turn bytecode/dispatch-table reads into constants.
         if bytes.iter().all(|b| matches!(b, Byte::Const(_))) {
@@ -318,21 +430,23 @@ impl State {
                         j += 1;
                     }
                     let len = j - i;
-                    // Bring the source to the load's width before shifting, so the
-                    // shifts and masks below are all one width.
+                    // Select the source bytes at their original width first.
+                    // Narrowing before this shift discards the high byte/word
+                    // being requested by a load from the middle of a spill.
                     let src_w = arena.width(expr);
-                    let mut t = if src_w == width {
-                        expr
-                    } else if src_w.bits() < width.bits() {
-                        arena.zext(expr, width)
+                    let selected = if index > 0 {
+                        let sh = arena.constant(index as u64 * 8, src_w);
+                        arena.bin(BinOp::Shr, expr, sh)
                     } else {
-                        arena.trunc(expr, width)
+                        expr
                     };
-                    // Select bytes `index .. index+len` of the source ...
-                    if index > 0 {
-                        let sh = arena.constant(index as u64 * 8, width);
-                        t = arena.bin(BinOp::Shr, t, sh);
-                    }
+                    let mut t = if src_w == width {
+                        selected
+                    } else if src_w.bits() < width.bits() {
+                        arena.zext(selected, width)
+                    } else {
+                        arena.trunc(selected, width)
+                    };
                     // ... masking only when the run is narrower than the result, so a
                     // run covering the whole load needs no mask at all.
                     if len * 8 < width.bits() as usize {
@@ -463,5 +577,169 @@ mod root_tests {
         }));
 
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod symbolic_subload_tests {
+    use super::*;
+
+    #[test]
+    fn every_symbolic_subload_selects_source_bytes_before_narrowing() {
+        for source_width in [Width::W8, Width::W16, Width::W32, Width::W64] {
+            for read_width in [Width::W8, Width::W16, Width::W32, Width::W64] {
+                if read_width.bytes() > source_width.bytes() {
+                    continue;
+                }
+                for offset in 0..=source_width.bytes() - read_width.bytes() {
+                    let mut arena = Arena::new();
+                    let mut state = State::new(&mut arena, 0x1000);
+                    let symbolic = arena.opaque("stored-word", source_width);
+                    state.store_concrete(&arena, 0x2000, symbolic, source_width);
+                    let loaded = state
+                        .load_concrete(&mut arena, 0x2000 + offset as u64, read_width, |_| None)
+                        .unwrap();
+                    for value in [0xfedc_ba98_7654_3210u64, 0x0123_4567_89ab_cdef, u64::MAX, 0] {
+                        let constant = arena.constant(value, source_width);
+                        let folded = arena.rewrite(loaded, &HashMap::from([(symbolic, constant)]));
+                        let expected =
+                            ((value & source_width.mask()) >> (8 * offset)) & read_width.mask();
+                        assert_eq!(
+                            arena.as_const(folded),
+                            Some(expected),
+                            "store {source_width:?}, load {read_width:?}, offset {offset}, input {value:#x}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_mixed_symbolic_subload_keeps_high_source_bytes_and_overwrites() {
+        let mut arena = Arena::new();
+        let mut state = State::new(&mut arena, 0x1000);
+        let first = arena.opaque("first", Width::W64);
+        let second = arena.opaque("second", Width::W16);
+        state.store_concrete(&arena, 0x2000, first, Width::W64);
+        state.store_concrete(&arena, 0x2003, second, Width::W16);
+        let loaded = state
+            .load_concrete(&mut arena, 0x2002, Width::W32, |_| None)
+            .unwrap();
+        let first_value = arena.constant(0x8877_6655_4433_2211, Width::W64);
+        let second_value = arena.constant(0xbbaa, Width::W16);
+        let folded = arena.rewrite(
+            loaded,
+            &HashMap::from([(first, first_value), (second, second_value)]),
+        );
+        assert_eq!(arena.as_const(folded), Some(0x66bb_aa33));
+    }
+}
+
+#[cfg(test)]
+mod symbolic_forwarding_tests {
+    use super::*;
+
+    fn address(arena: &mut Arena, base: Ref, offset: u64) -> Ref {
+        let offset = arena.constant(offset, Width::W64);
+        arena.bin(BinOp::Add, base, offset)
+    }
+
+    #[test]
+    fn symbolic_forwarding_matches_byte_memory_after_partial_overwrites() {
+        let mut arena = Arena::new();
+        let mut state = State::new(&mut arena, 0x1000);
+        let base = arena.opaque("dynamic-stack", Width::W64);
+        let mut expected = HashMap::new();
+        for i in 0..80u64 {
+            let width = [Width::W8, Width::W16, Width::W32, Width::W64][i as usize % 4];
+            let offset = (i * 7 % 19).wrapping_sub(12);
+            let value = 0x8877_6655_4433_2211u64.wrapping_mul(i + 1);
+            let stored = arena.constant(value, width);
+            let at = address(&mut arena, base, offset);
+            state.store_symbolic(&arena, at, stored, width);
+            for byte in 0..width.bytes() {
+                expected.insert(
+                    offset.wrapping_add(byte as u64),
+                    (value >> (byte * 8)) as u8,
+                );
+            }
+            for read_width in [Width::W8, Width::W16, Width::W32, Width::W64] {
+                for read_offset in -14i64..28 {
+                    let at = address(&mut arena, base, read_offset as u64);
+                    let actual = state.load_symbolic(&mut arena, at, read_width);
+                    let bytes: Option<Vec<_>> = (0..read_width.bytes())
+                        .map(|j| {
+                            expected
+                                .get(&(read_offset as u64).wrapping_add(j as u64))
+                                .copied()
+                        })
+                        .collect();
+                    let want = bytes.map(|bytes| {
+                        bytes
+                            .iter()
+                            .enumerate()
+                            .fold(0u64, |v, (j, b)| v | ((*b as u64) << (8 * j)))
+                    });
+                    assert_eq!(actual.and_then(|v| arena.as_const(v)), want);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn symbolic_forwarding_rejects_unknown_aliases_and_new_load_generations() {
+        let mut arena = Arena::new();
+        let mut state = State::new(&mut arena, 0x1000);
+        let pointer_slot = arena.constant(0x2000, Width::W64);
+        let before = arena.load_at(pointer_slot, Width::W64, 1);
+        let after = arena.load_at(pointer_slot, Width::W64, 2);
+        let value = arena.constant(0x1234, Width::W64);
+        state.store_symbolic(&arena, before, value, Width::W64);
+        assert_eq!(
+            state.load_symbolic(&mut arena, before, Width::W64),
+            Some(value)
+        );
+        assert_eq!(state.load_symbolic(&mut arena, after, Width::W64), None);
+        state.store_symbolic(&arena, after, value, Width::W64);
+        assert_eq!(state.load_symbolic(&mut arena, before, Width::W64), None);
+        state.store_concrete(&arena, 0x3000, value, Width::W64);
+        assert_eq!(state.load_symbolic(&mut arena, after, Width::W64), None);
+        state.store_symbolic(&arena, before, value, Width::W64);
+        state.forget_concrete(0x4000, 1);
+        assert_eq!(state.load_symbolic(&mut arena, before, Width::W64), None);
+    }
+
+    #[test]
+    fn symbolic_forwarding_preserves_compaction_and_negative_base_offsets() {
+        let mut arena = Arena::new();
+        let mut state = State::new(&mut arena, 0x1000);
+        let base = arena.opaque("dynamic-size", Width::W64);
+        let top = arena.constant(0x10000, Width::W64);
+        let stack = arena.bin(BinOp::Sub, top, base);
+        let at = address(&mut arena, stack, u64::MAX - 7);
+        let stored = arena.opaque("stored-symbolic", Width::W64);
+        state.store_symbolic(&arena, at, stored, Width::W64);
+        let negbase = arena.un(UnOp::Neg, base);
+        let equivalent = address(&mut arena, negbase, 0xfff8);
+        assert_eq!(
+            state.load_symbolic(&mut arena, equivalent, Width::W64),
+            Some(stored)
+        );
+        let remap = arena.compact(&state.symbolic_roots());
+        state.remap_refs(&remap);
+        let stored = remap[&stored];
+        let at = remap[&at];
+        assert_eq!(
+            state.load_symbolic(&mut arena, at, Width::W64),
+            Some(stored)
+        );
+        let read = address(&mut arena, at, 5);
+        let loaded = state.load_symbolic(&mut arena, read, Width::W16).unwrap();
+        let concrete = arena.constant(0x8877_6655_4433_2211, Width::W64);
+        let actual = arena.rewrite(loaded, &HashMap::from([(stored, concrete)]));
+        assert_eq!(arena.as_const(actual), Some(0x7766));
+        state.forget_symbolic_memory();
+        assert_eq!(state.load_symbolic(&mut arena, at, Width::W64), None);
     }
 }
