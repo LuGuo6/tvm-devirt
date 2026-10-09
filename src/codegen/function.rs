@@ -965,6 +965,19 @@ mod host_rsp_tests {
     }
 
     #[test]
+    fn rejects_subregister_host_rsp_write() {
+        // add esp, 1 is a 32-bit write that also changes host RSP; only exact
+        // 64-bit RSP arithmetic belongs to the constant delta model.
+        let bytes = [0x83, 0xc4, 0x01, 0xc3];
+        assert!(
+            verify_host_rsp(&bytes, 0x1000)
+                .unwrap_err()
+                .to_string()
+                .contains("unrecognised RSP write")
+        );
+    }
+
+    #[test]
     fn rejects_dynamic_host_rsp_write() {
         // mov rsp,rax cannot be represented by the fixed-frame delta model.
         let bytes = [0x48, 0x89, 0xc4, 0xc3];
