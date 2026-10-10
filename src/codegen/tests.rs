@@ -10,6 +10,41 @@ use crate::ir::regalloc::{Item, Segment};
 use crate::ir::sched::ValId;
 
 #[test]
+fn direct_emission_rejects_recovery_failures_even_with_valid_scheduled_blocks() {
+    use crate::ir::expr::{Arena, BlockRef};
+    use crate::ir::Block;
+    let mut arena = Arena::new();
+    let ret = arena.opaque("return_address", Width::W64);
+    let id = BlockId { handler: 0x100000, vip: None };
+    let mut cfg = Cfg {
+        entry: id, arena,
+        blocks: vec![Block { id, block_ref: BlockRef(0), params: vec![], events: vec![],
+            from_vm_context: false, exit_regs: vec![],
+            terminator: Terminator::Return { dest: ret }, cost: 1, preds: vec![] }],
+        total_steps: 1, unresolved: 0, back_edges: vec![], trivial_phis_removed: 0,
+        timed_out: false, stack_base: 0x7fff00002000, native_entry_proofs: Default::default(), vm_range: (0, 0),
+    };
+    let blocks = sched::schedule(&cfg);
+    let allocs: Vec<_> = blocks.iter().map(regalloc::allocate).collect();
+    let pe = PeFile {
+        data: vec![], image_base: 0x100000, entry_point_rva: 0, size_of_image: 0x2000,
+        sections: vec![], opt_header_offset: 0, section_table_offset: 0,
+        file_alignment: 0x200, section_alignment: 0x1000, size_of_headers: 0, loader_bound: vec![],
+    };
+    let bytes = emit_function(&cfg, &blocks, &allocs, id.handler, &pe).unwrap();
+    assert!(iced_x86::Decoder::with_ip(64, &bytes, id.handler, 0)
+        .into_iter().any(|i| i.mnemonic() == iced_x86::Mnemonic::Ret));
+    // The scheduled code remains well formed. The later failed incoming-edge
+    // proof is attached to the CFG and must still block direct CLI emission.
+    cfg.unresolved = 1;
+    assert!(emit_function(&cfg, &blocks, &allocs, id.handler, &pe).is_err(),
+        "a late failed proof must not be bypassed by the single-function emitter");
+    cfg.unresolved = 0;
+    cfg.timed_out = true;
+    assert!(emit_function(&cfg, &blocks, &allocs, id.handler, &pe).is_err());
+}
+
+#[test]
 fn stack_probe_codegen_preserves_effect_and_exports_differential_fixtures() {
     for kind in ["registers", "swapped", "spills", "frame"] {
         let mut alloc = Alloc::default();
@@ -989,7 +1024,7 @@ fn call_return_object_survives_virtual_tail_target_and_argument_setup() {
             trivial_phis_removed: 0,
             timed_out: false,
             stack_base,
-            vm_range: (0, 0),
+            native_entry_proofs: Default::default(), vm_range: (0, 0),
         };
         let blocks = sched::schedule(&cfg);
         let block = &blocks[0];
@@ -1937,6 +1972,19 @@ pub(super) fn text_of(instrs: &[Instr], alloc: &Alloc, layout: &FrameLayout) -> 
     out
 }
 
+/// A historical return without a proven location must fail code generation.
+#[test]
+fn a_call_return_without_a_proven_home_is_rejected() {
+    let mut asm = CodeAssembler::new(64).unwrap();
+    let instruction = Instr::Opaque {
+        dst: ValId(0), tag: "call_ret", width: Width::W64, at: None,
+    };
+    let error = emit_instr(&mut asm, &Alloc::default(), &instruction, 0,
+        &FrameLayout::new(0, 0, false), ImageRange::none(), Some(&[instruction.clone()]),
+        &CallRedirects::none()).unwrap_err();
+    assert!(error.to_string().contains("no proven block-entry register home"));
+}
+
 /// A return value the allocator homes outside RAX is moved there from RAX.
 #[test]
 fn a_return_value_homed_outside_rax_is_moved_from_rax() {
@@ -2000,11 +2048,11 @@ fn a_spilled_return_value_is_stored_to_its_slot() {
     );
 }
 
-/// An opaque with no architectural home emits nothing.
+/// Undefined instruction results retain the legacy no-write behavior.
 #[test]
 fn an_opaque_with_no_home_emits_no_instruction() {
     let v = ValId(0);
-    for tag in ["af_undef", "clobbered", "flag", "xreg"] {
+    for tag in ["af_undef", "xreg"] {
         let instrs = vec![Instr::Opaque {
             dst: v,
             tag,
@@ -2025,6 +2073,23 @@ fn an_opaque_with_no_home_emits_no_instruction() {
             text.is_empty(),
             "{tag:?} has no definition to emit, got {text:?}"
         );
+    }
+}
+
+#[test]
+fn uncaptured_call_output_without_home_is_rejected() {
+    let v = ValId(0);
+    for tag in ["clobbered", "flag"] {
+        for loc in [Loc::Reg(Reg::Rcx), Loc::Spill(0)] {
+            let instr = Instr::Opaque { dst: v, tag, width: Width::W64, at: None };
+            let alloc = Alloc { segments: vec![Segment { item: Item::Val(v),
+                start: 0, end: 4, loc }], slots: 1, ..Alloc::default() };
+            let mut asm = CodeAssembler::new(64).unwrap();
+            let result = emit_instr(&mut asm, &alloc, &instr, 0,
+                &FrameLayout::new(0, 1, false), ImageRange::none(), None,
+                &CallRedirects::none());
+            assert!(result.is_err(), "read of {tag} in {loc:?} has no captured value");
+        }
     }
 }
 

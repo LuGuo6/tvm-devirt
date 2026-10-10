@@ -11,6 +11,43 @@ use iced_x86::{
 };
 use std::collections::{HashMap, HashSet};
 
+#[cfg(test)]
+#[path = "context_tests.rs"]
+pub(crate) mod context_tests;
+#[path = "context_origin.rs"]
+mod context_origin;
+pub(crate) use context_origin::ContextIdentity;
+use context_origin::{ContextTracker, Origin};
+#[path = "location_home.rs"]
+mod location_home;
+pub(crate) use location_home::LocationHomePlan;
+#[path = "native_join.rs"]
+mod native_join;
+pub(crate) use native_join::NativeJoinPlan;
+#[cfg(test)]
+#[path = "noreturn_chain_tests.rs"]
+mod noreturn_chain_tests;
+#[cfg(test)]
+#[path = "callret_memory_tests.rs"]
+mod callret_memory_tests;
+#[cfg(test)]
+#[path = "call_output_review_tests.rs"]
+mod call_output_review_tests;
+#[cfg(test)]
+#[path = "substitution_generation_tests.rs"]
+mod substitution_generation_tests;
+#[cfg(test)]
+#[path = "indirect_call_tests.rs"]
+mod indirect_call_tests;
+#[cfg(test)]
+#[path = "mutable_bss_tests.rs"]
+mod mutable_bss_tests;
+#[cfg(test)]
+#[path = "bounded_store_generation_tests.rs"]
+mod bounded_store_generation_tests;
+#[path = "native_probe.rs"]
+mod native_probe;
+
 /// Order of the guest register image in the VM context.
 pub const GUEST_IMAGE_ORDER: [Reg; 16] = [
     Reg::Rax,
@@ -103,7 +140,7 @@ fn noreturn_import_slots(pe: &PeFile) -> Vec<u64> {
         .collect()
 }
 
-/// How far [`callee_never_returns`] scans before giving up. A throw wrapper is a handful of instructions: set up one argument, call, trap.
+/// Bound the straight-line proof, including every setup instruction and call.
 const NORETURN_SCAN_INSTRS: usize = 32;
 
 /// TVM's private stack-probe helper. It preserves RAX, RCX, and RFLAGS,
@@ -538,6 +575,20 @@ pub struct Emulator<'a> {
     pub arena: Arena,
     pub state: State,
     pub events: Vec<Event>,
+    /// Monotone proof bit for native-only incoming-state handling. Recovery
+    /// clears it when context or unrepresented interpreter effects are seen.
+    pub(crate) native_effects_complete: bool,
+    /// Positive pre-VM history, used only to classify a block entrance.
+    pub(crate) native_prefix_complete: bool,
+    /// Instructions individually checked by the native architectural proof.
+    /// Unlike the bounded diagnostic trace, this covers the whole path.
+    pub(crate) native_history_steps: usize,
+    /// Exact return refs recorded on guest Call events. Opaque tags alone do
+    /// not prove provenance. Clones retain the set; compaction remaps it.
+    guest_call_results: HashSet<Ref>,
+    /// Exact caller stack locations exposed as arguments to an observed call.
+    /// A later W64 load can produce an object pointer through an out parameter.
+    guest_call_output_slots: HashSet<u64>,
     /// Base value RSP was concretized to.
     pub stack_base: u64,
     /// Instruction addresses visited, most recent last, capped at [`TRACE_TAIL_CAP`] entries. Recovery only ever reads the *count* of instructions interpreted, to charge a block its cost; the addresses themselves are a debugging aid for `inspect --tail`.
@@ -606,6 +657,12 @@ pub struct Emulator<'a> {
     /// Layout the guest register image was found to use, once known. Cached with
     /// the base, since the two are only meaningful together.
     pub guest_layout: Option<Layout>,
+    context_tracker: ContextTracker,
+    /// A full restore/save round trip identifies a historical image, but does
+    /// not prove that the next VM consumer still uses it. Keep promotion behind
+    /// an explicit diagnostic switch until consumer provenance is implemented.
+    diagnostic_context_origin: bool,
+    pub(crate) diagnostic_location_homes: bool,
     pub vip_slot: Option<u64>,
 }
 
@@ -645,6 +702,11 @@ impl<'a> Emulator<'a> {
             arena,
             state,
             events: Vec::new(),
+            guest_call_results: HashSet::new(),
+            native_effects_complete: true,
+            native_prefix_complete: true,
+            native_history_steps: 0,
+            guest_call_output_slots: HashSet::new(),
             stack_base,
             trace: std::collections::VecDeque::new(),
             steps: 0,
@@ -672,6 +734,11 @@ impl<'a> Emulator<'a> {
             vm_range,
             written_args: std::collections::HashSet::new(),
             guest_layout: None,
+            context_tracker: ContextTracker::default(),
+            diagnostic_context_origin: std::env::var("TVM_DIAGNOSTIC_CONTEXT_ORIGIN")
+                .is_ok_and(|value| value == "1"),
+            diagnostic_location_homes: std::env::var("TVM_DIAGNOSTIC_LOCATION_HOMES")
+                .is_ok_and(|value| value == "1"),
             // Set by the caller from `discover_vip_slot` before recovery proper.
             // Left `None` here so that nothing silently depends on a default offset:
             // a wrong constant would degenerate `(handler, vip)` to `handler` and
@@ -1254,23 +1321,49 @@ impl<'a> Emulator<'a> {
     /// Guest registers, read from the cached context base, locating it first if necessary. `None` means this function has no VM context.
     pub fn guest_registers(&mut self) -> Option<Vec<(Reg, Ref)>> {
         let base = self.locate_guest_context()?;
-        let (_, _, regs) = self.probe_context_at(base);
+        let layout = self.guest_layout?;
+        let (_, _, regs) = self.probe_layout_at(base, layout);
         if regs.is_empty() { None } else { Some(regs) }
     }
 
+    /// Diagnostic round-trip image and concrete guest-frame shape, compared on
+    /// every incoming edge. This is not a proof of the next VM consumer's image;
+    /// default recovery never uses it to authorize seeding or emission.
+    pub(crate) fn guest_context_identity(&mut self) -> Result<Option<ContextIdentity>, ()> {
+        if !self.diagnostic_context_origin || !self.context_tracker.required { return Ok(None); }
+        let (base, layout_index) = self.context_tracker.current().ok_or(())?;
+        let address = LAYOUTS[layout_index].slot(base, Reg::Rsp).ok_or(())?;
+        let guest_rsp = self.read_slot(address).and_then(|r| self.arena.as_const(r)).ok_or(())?;
+        if guest_rsp.abs_diff(self.stack_base) > crate::ir::sched::FRAME_WINDOW {
+            return Err(());
+        }
+        Ok(Some(ContextIdentity { base, layout_index, guest_rsp }))
+    }
+
     pub fn locate_guest_context(&mut self) -> Option<u64> {
+        if self.diagnostic_context_origin && self.context_tracker.required {
+            let Some((base, layout_index)) = self.context_tracker.current() else {
+                self.guest_ctx = None;
+                self.guest_layout = None;
+                return None;
+            };
+            self.guest_ctx = Some(base);
+            self.guest_layout = Some(LAYOUTS[layout_index]);
+            self.reclassify_events();
+            return Some(base);
+        }
         if let Some(cached) = self.guest_ctx {
-            let (cached_score, _, _) = self.probe_context_at(cached);
+            let cached_layout = self.guest_layout.unwrap_or(LAYOUTS[0]);
+            let (cached_score, _, _) = self.probe_layout_at(cached, cached_layout);
             // The speculative search records a miss when it fails, but falling back to
             // the cached base is a success, so the miss must not be left behind.
             let saved_miss = self.ctx_miss;
             let found = self.search_guest_context();
             self.ctx_miss = saved_miss;
             if let Some(fresh) = found {
-                let (fresh_score, _, _) = self.probe_context_at(fresh);
-                if fresh != cached && fresh_score > cached_score {
+                let (fresh_score, _, _, layout) = self.probe_best_layout(fresh);
+                if fresh_score > cached_score {
                     self.guest_ctx = Some(fresh);
-                    let (_, _, _, layout) = self.probe_best_layout(fresh);
                     self.guest_layout = Some(layout);
                     return Some(fresh);
                 }
@@ -1278,12 +1371,15 @@ impl<'a> Emulator<'a> {
             return Some(cached);
         }
         // Two independent locators. The entry-spill pattern is tried first because it observes the context actually being *built*, which does not depend on where RBP happens to point when evaluation stops.
-        let base = self
+        let found = self
             .context_from_entry_spills()
-            .or_else(|| self.search_guest_context());
+            .or_else(|| self.search_guest_context().map(|base| {
+                let (_, _, _, layout) = self.probe_best_layout(base);
+                (base, layout)
+            }));
+        let base = found.map(|(base, _)| base);
         self.guest_ctx = base;
-        if let Some(b) = base {
-            let (_, _, _, layout) = self.probe_best_layout(b);
+        if let Some((_, layout)) = found {
             self.guest_layout = Some(layout);
         }
         if base.is_some() {
@@ -1313,8 +1409,8 @@ impl<'a> Emulator<'a> {
     }
 
     /// Locate the guest register image from the entry sequence that fills it. On entry the VM spills every guest register into the context, so the store log contains `Store { addr: k, value: InitReg(r) }` for each register at its own fixed slot.
-    fn context_from_entry_spills(&self) -> Option<u64> {
-        let mut votes: HashMap<u64, HashSet<Reg>> = HashMap::new();
+    fn context_from_entry_spills(&self) -> Option<(u64, Layout)> {
+        let mut votes: HashMap<(u64, usize), HashSet<Reg>> = HashMap::new();
         for e in &self.events {
             let Event::Store {
                 addr,
@@ -1332,21 +1428,21 @@ impl<'a> Emulator<'a> {
             // Vote under every candidate layout: each implies a different base for
             // the same store, and the layout that is actually in use is the one whose
             // implied base collects votes from many registers at once.
-            for layout in LAYOUTS {
+            for (layout_index, layout) in LAYOUTS.iter().enumerate() {
                 let Some(slot) = layout.order.iter().position(|r| r == reg) else {
                     continue;
                 };
                 let Some(implied) = a.checked_sub(layout.first_reg + slot as u64 * 8) else {
                     continue;
                 };
-                votes.entry(implied).or_default().insert(*reg);
+                votes.entry((implied, layout_index)).or_default().insert(*reg);
             }
         }
         votes
             .into_iter()
             .filter(|(_, regs)| regs.len() >= MIN_SPILL_REGS)
-            .max_by_key(|(base, regs)| (regs.len(), *base))
-            .map(|(base, _)| base)
+            .max_by_key(|((base, layout), regs)| (regs.len(), *base, std::cmp::Reverse(*layout)))
+            .map(|((base, layout), _)| (base, LAYOUTS[layout]))
     }
 
     /// Locate the guest register image inside the VM context by content.
@@ -1397,9 +1493,16 @@ impl<'a> Emulator<'a> {
         let mut out = Vec::new();
         let layout = self.guest_layout.unwrap_or(LAYOUTS[0]);
         for (i, reg) in layout.order.iter().enumerate() {
+            // Diagnostic only: compare concrete frame shapes on all incoming
+            // edges. The independent consumer-provenance proof is still open.
+            if *reg == Reg::Rsp && self.diagnostic_context_origin && self.context_tracker.required {
+                continue;
+            }
             let addr = base.wrapping_add(layout.first_reg + i as u64 * 8);
             let p = self.arena.param(block, *reg);
             self.state.store_concrete(&self.arena, addr, p, Width::W64);
+            self.arena.bump_mem_gen();
+            self.arena.note_concrete_store(addr, Width::W64.bytes());
             out.push((*reg, p));
         }
         out
@@ -1524,6 +1627,12 @@ impl<'a> Emulator<'a> {
 
     /// Classify address that did not fold to a constant.
     fn region_of_symbolic(&self, addr: Ref) -> Region {
+        // A call-return pointer, field displacement, or loaded child pointer
+        // addresses observable memory. Check this before mistaking a small
+        // field displacement for an interpreter address below guest RSP.
+        if self.is_guest_call_address(addr) {
+            return Region::Guest;
+        }
         if let Some((BinOp::Add, x, y)) = self.arena.as_bin(addr) {
             for (a, b) in [(x, y), (y, x)] {
                 let _ = b;
@@ -1538,6 +1647,29 @@ impl<'a> Emulator<'a> {
             Region::Guest
         } else {
             Region::VmInternal
+        }
+    }
+
+    /// Follow pointer bases through loads and x86-sized field displacements.
+    /// A call result used as an index into a VM table is not a pointer proof.
+    fn is_guest_call_address(&self, mut addr: Ref) -> bool {
+        loop {
+            if self.guest_call_results.contains(&addr) {
+                return true;
+            }
+            match *self.arena.op(addr) {
+                Op::Load(base, _) if self.arena.width(addr) == Width::W64 => addr = base,
+                Op::Bin(BinOp::Add, left, right) => {
+                    if self.arena.as_const(right).is_some_and(|n| i32::try_from(n as i64).is_ok()) {
+                        addr = left;
+                    } else if self.arena.as_const(left).is_some_and(|n| i32::try_from(n as i64).is_ok()) {
+                        addr = right;
+                    } else { return false; }
+                }
+                Op::Bin(BinOp::Sub, base, displacement)
+                    if self.arena.as_const(displacement).is_some_and(|n| i32::try_from(n as i64).is_ok()) => addr = base,
+                _ => return false,
+            }
         }
     }
 
@@ -1651,17 +1783,18 @@ impl<'a> Emulator<'a> {
         if let Some(a) = self.arena.as_const(addr) {
             // Do not fold a read from a writable section. The loader or runtime may write a different value there before the code runs, so the file content is a placeholder rather than the real value.
             let writable = self.pe.is_writable(a);
-            // BSS (uninitialized data) is an exception: it is in a writable section but is zero-initialized by the loader, so we can fold it to zero at load time.
+            // BSS is initialized once by the loader, then remains mutable.
+            // An arbitrary invocation must read its current runtime value.
             let is_bss = self.pe.is_bss(a);
+            // Keep the existing conservative native-join restriction as well.
+            if is_bss { self.native_effects_complete = false; self.native_prefix_complete = false; }
             // An IAT slot is not writable by its section bits but *is* rewritten by the
             // loader, so it must be refused for the same reason a `.data` global is.
             let bound = self.pe.is_loader_bound(a, width.bytes() as u64);
             let pe = self.pe;
             let arena = &mut self.arena;
             let img = |x: u64| pe.image_u8(x);
-            // Fold if: (not writable OR is BSS) AND not loader-bound
-            // BSS is writable but we know it's zero at load time
-            if (!writable || is_bss) && !bound {
+            if !writable && !bound {
                 if let Some(v) = self.state.load_concrete(arena, a, width, img) {
                     return v;
                 }
@@ -1669,6 +1802,9 @@ impl<'a> Emulator<'a> {
 
             // Did not resolve.
             let v = self.arena.load(addr, width);
+            if width == Width::W64 && self.guest_call_output_slots.contains(&a) {
+                self.guest_call_results.insert(v);
+            }
             if self.pe.image_u8(a).is_none() {
                 self.unmapped_loads.push((site, a, width));
             }
@@ -1779,7 +1915,8 @@ impl<'a> Emulator<'a> {
     /// from a section the loader or the runtime may have rewritten.
     fn image_load(&mut self, addr: u64, width: Width) -> Option<Ref> {
         let is_bss = self.pe.is_bss(addr);
-        if self.pe.is_writable(addr) && !is_bss {
+        if is_bss { self.native_effects_complete = false; self.native_prefix_complete = false; }
+        if self.pe.is_writable(addr) {
             return None;
         }
         if self.pe.is_loader_bound(addr, width.bytes() as u64) {
@@ -1796,12 +1933,14 @@ impl<'a> Emulator<'a> {
     /// wider than the IR's scalar widths.
     fn forget_memory(&mut self, addr: Ref, bytes: u32) {
         if let Some(a) = self.arena.as_const(addr) {
+            self.expire_call_output_slots(a, bytes);
             self.state.forget_concrete(a, bytes);
             self.arena.bump_mem_gen();
             self.arena.note_concrete_store(a, bytes);
         } else {
             // Keep the unknown write in the diagnostic history, and invalidate
             // forwarding rather than claiming a scalar opaque covers all bytes.
+            self.forget_call_output_slots();
             let w = Width::from_bytes(bytes).unwrap_or(Width::W64);
             let v = self.arena.opaque("boxed_mem", w);
             // The boxed write can be wider than any scalar IR width, so its
@@ -1815,6 +1954,7 @@ impl<'a> Emulator<'a> {
 
     fn store(&mut self, addr: Ref, value: Ref, width: Width, site: u64) {
         if let Some(a) = self.arena.as_const(addr) {
+            self.expire_call_output_slots(a, width.bytes());
             // Track the phantom-unwind pointer the VM parks in its frame for
             // SEH. It is a `.tvm0` pointer that never changes, so recording it
             // here keeps VIP detection from latching onto it.
@@ -1843,9 +1983,12 @@ impl<'a> Emulator<'a> {
             });
             return;
         }
+        self.forget_call_output_slots();
         self.state.store_symbolic(&self.arena, addr, value, width);
         self.arena.bump_mem_gen();
-        self.arena.note_symbolic_store();
+        if !self.arena.note_bounded_symbolic_store(addr, width.bytes()) {
+            self.arena.note_symbolic_store();
+        }
         let region = self.region_of_symbolic(addr);
         self.events.push(Event::Store {
             addr,
@@ -2085,7 +2228,9 @@ impl<'a> Emulator<'a> {
         let Some(inst) = disasm::decode_at(self.pe, ip) else {
             return Step::Stopped(Stop::Unreadable { site: ip });
         };
+        self.track_context_instruction(&inst);
         self.steps += 1;
+        NativeJoinPlan::record_step(self, &inst);
         if self.trace.len() == TRACE_TAIL_CAP {
             self.trace.pop_front();
         }
@@ -2524,8 +2669,10 @@ impl<'a> Emulator<'a> {
                         if is_iat_tail_call(slot, &self.import_slots) {
                             let rsp = self.state.concrete_rsp(&self.arena);
                             let args = self.call_arguments();
+                            self.expose_call_stack_arguments(&args);
                             // Before the push, so the event can name the opaque.
                             let ret = self.clobber_call();
+                            self.guest_call_results.extend(ret);
                             self.events.push(Event::Call {
                                 target: None,
                                 site: ip,
@@ -2634,19 +2781,31 @@ impl<'a> Emulator<'a> {
                         }
                     }
                 }
-                let target = disasm::direct_target(&inst).or_else(|| {
-                    let d = self.read_op(&inst, 0);
-                    self.arena.as_const(d)
-                });
+                // Capture the complete operand before ABI clobbers. A dynamic
+                // vtable/function pointer remains a semantic call target even
+                // when it cannot be resolved to a fixed address in this image.
+                let raw_target = match disasm::direct_target(&inst) {
+                    Some(address) => self.arena.constant(address, Width::W64),
+                    None => self.read_op(&inst, 0),
+                };
+                let concrete_target = self.arena.as_const(raw_target);
                 // A target that is not executable code was never a callee: it is an
                 // unbound import entry or a misfolded value. Discarding it keeps the
                 // event honest instead of naming a bogus address.
-                let target = target.filter(|t| self.pe.is_executable(*t));
-                let internal = target.is_some_and(|t| self.in_vm(t));
+                let target = concrete_target.filter(|t| self.pe.is_executable(*t));
+                let internal = target.is_some_and(|t| self.in_vm(t)
+                    || (std::env::var_os("TVM_DIAGNOSTIC_INLINE_CHKSTK").is_some()
+                        && native_probe::is_msvc_stack_probe(self.pe, t)));
                 if internal {
+                    if let Some(sp) = self.state.concrete_rsp(&self.arena) {
+                        self.context_tracker.store(sp.wrapping_sub(8), 8, Origin::default(), false);
+                    } else { self.context_tracker.invalidate(); }
+                    self.context_tracker.set_reg(Reg::Rsp, Origin::default());
                     if target.is_some_and(|t| is_tvm_stack_probe(self.pe, t))
                         && self.stack_probe_summary_enabled()
                     {
+                        self.native_effects_complete = false; self.native_prefix_complete = false;
+                        self.context_tracker.invalidate();
                         // Summarize the complete CALL/helper/RET sequence. The
                         // return address cancels out and `ret 8` consumes the
                         // caller's argument. In particular, do not ABI-clobber
@@ -2682,12 +2841,28 @@ impl<'a> Emulator<'a> {
                 }
                 // Guest call: record it, skip over it, and mark the volatile
                 // register set as clobbered per the Windows x64 ABI.
-                let t = target.map(|t| self.arena.constant(t, Width::W64));
+                self.context_tracker.guest_call(self.in_vm(ip));
+                let t = if concrete_target.is_none() {
+                    Some(raw_target)
+                } else {
+                    target.map(|t| self.arena.constant(t, Width::W64))
+                };
                 let rsp = self.state.concrete_rsp(&self.arena);
                 // Keep arguments explicitly established by this run before applying
                 // ABI clobbers.
-                let args = self.call_arguments();
+                let mut args = self.call_arguments();
+                // Some native helpers (including cookie checks) intentionally
+                // leave RAX unchanged on a returning path.  Restore the real
+                // incoming RAX before the retained native CALL; otherwise
+                // argument setup may overwrite that observable input.
+                if target.is_some_and(|entry| {
+                    callee_observes_incoming_rax(self.pe, entry, self.vm_range)
+                }) {
+                    args.push((Reg::Rax, self.state.reg(Reg::Rax)));
+                }
+                self.expose_call_stack_arguments(&args);
                 let ret = self.clobber_call();
+                self.guest_call_results.extend(ret);
                 self.events.push(Event::Call {
                     target: t,
                     site: ip,
@@ -2807,6 +2982,7 @@ impl<'a> Emulator<'a> {
 
     /// Record an instruction verbatim and make its effects opaque. The instruction is not modelled: it is kept as bytes so lowering can re-emit it, and its register/flag results become opaques so nothing downstream assumes a stale value.
     fn box_instruction(&mut self, inst: &Instruction, ip: u64, next: u64) -> Step {
+        self.context_tracker.invalidate();
         let mut fmt = iced_x86::IntelFormatter::new();
         let mut text = String::new();
         iced_x86::Formatter::format(&mut fmt, inst, &mut text);
@@ -2903,7 +3079,9 @@ impl<'a> Emulator<'a> {
                     // Re-attempt resolution against image/abstract memory now that the address may have become concrete. This must not go through `load`, which records events: substitution is a pure rewrite and may be run many times over the same node.
                     if let Some(c) = self.arena.as_const(a) {
                         let is_bss = self.pe.is_bss(c);
-                        if (!self.pe.is_writable(c) || is_bss)
+                        if is_bss { self.native_effects_complete = false; self.native_prefix_complete = false; }
+                        if self.arena.load_version_is_current(a, w, gen_at)
+                            && !self.pe.is_writable(c)
                             && !self.pe.is_loader_bound(c, w.bytes() as u64)
                         {
                             let pe = self.pe;
@@ -3201,6 +3379,23 @@ impl<'a> Emulator<'a> {
         // Invalidate forwarding for every boxed instruction conservatively.
         self.state.forget_symbolic_memory();
 
+        // Iced reports implicit string/masked writes even when there is no
+        // explicit Memory operand. Their extent may depend on RCX/DF, so no
+        // concrete byte or exposed out-slot fact survives an unknown extent.
+        let mut info_factory = InstructionInfoFactory::new();
+        let explicit_memory = (0..inst.op_count()).any(|i| inst.op_kind(i) == OpKind::Memory);
+        let unknown_extent_write = info_factory.info(inst).used_memory().iter().any(|memory| {
+            matches!(memory.access(), OpAccess::Write | OpAccess::CondWrite
+                | OpAccess::ReadWrite | OpAccess::ReadCondWrite)
+                && (!explicit_memory || memory.memory_size().size() == 0)
+        });
+        if unknown_extent_write {
+            self.forget_call_output_slots();
+            self.state.mem.clear();
+            self.arena.bump_mem_gen();
+            self.arena.note_symbolic_store();
+        }
+
         // Registers this instruction leaves a value in, for `Event::Boxed::defs`.
         // Only the fixed-register hardware reads report here: the generic case below
         // clobbers a register named by the encoding, which `emit_boxed` re-emits
@@ -3315,20 +3510,70 @@ impl<'a> Emulator<'a> {
         }
     }
 
-    /// Argument registers explicitly written during this run. Untouched entry values
-    /// are retained when marked as written because the callee's arity is unknown.
+    /// Explicitly established arguments and untouched ABI inputs. The callee's
+    /// arity is unknown, so an original entry register remains observable even
+    /// when the wrapper forwards it without first executing a MOV to it.
     fn call_arguments(&self) -> Vec<(Reg, Ref)> {
         ARG_REGS
             .iter()
-            .filter(|r| self.written_args.contains(r))
+            .filter(|r| self.written_args.contains(r)
+                || matches!(self.arena.op(self.state.reg(**r)), Op::InitReg(original) if original == *r))
             .map(|r| (*r, self.state.reg(*r)))
             .collect()
+    }
+
+    /// Callees can write through caller-owned stack pointers passed explicitly.
+    /// Keep exact out-pointer roots and invalidate caller-owned known bytes,
+    /// since neither the callee's arity nor output extent is known.
+    /// The interpreter's lower private frame is not a caller-owned argument.
+    fn expose_call_stack_arguments(&mut self, args: &[(Reg, Ref)]) {
+        let Some(rsp) = self.state.concrete_rsp(&self.arena) else { return; };
+        // This runs at the actual external CALL, before its architectural push.
+        // The machine RSP is the callee's caller boundary at this point. A
+        // cached VM-image RSP (or its entry-RSP fallback) is not that proof.
+        let floor = rsp;
+        let Some(ceiling) = self.stack_base.checked_add(crate::ir::sched::FRAME_WINDOW) else { return; };
+        let starts: Vec<_> = args.iter().filter_map(|(_, value)| self.arena.as_const(*value))
+            .filter(|&addr| addr >= floor && addr <= ceiling
+                && addr.abs_diff(self.stack_base) <= crate::ir::sched::FRAME_WINDOW
+                && self.pe.section_for_va(addr).is_none())
+            .collect();
+        if !starts.is_empty() {
+            self.guest_call_output_slots.extend(starts);
+            // A passed pointer may designate the middle of an object or a
+            // larger ancestor frame. Neither its base nor FRAME_WINDOW bounds
+            // callee writes. Windows x64 has no caller red zone below RSP.
+            self.state.mem.retain(|&addr, _| addr < floor);
+            self.state.forget_symbolic_memory();
+        }
+    }
+
+    /// Stack slots can later be reused for interpreter state. New writes do
+    /// not inherit a prior out-parameter origin, including partial overwrites.
+    fn expire_call_output_slots(&mut self, address: u64, bytes: u32) {
+        self.guest_call_output_slots.retain(|slot| {
+            !(0..bytes as u64).any(|i| address.wrapping_add(i).wrapping_sub(*slot) < 8)
+        });
+    }
+
+    /// Unknown writes can alias every exposed slot. Retain the provenance of
+    /// values already read; invalidate only future reads and their byte facts.
+    fn forget_call_output_slots(&mut self) {
+        for slot in self.guest_call_output_slots.drain() {
+            for i in 0..8 {
+                self.state.mem.remove(&slot.wrapping_add(i));
+            }
+        }
     }
 
     /// Clobber the volatile registers a call destroys, returning the `call_ret`
     /// opaque left in RAX so the caller can record it on the event.
     fn clobber_call(&mut self) -> Option<Ref> {
         self.state.forget_symbolic_memory();
+        // Forwarding invalidation alone does not separate a pre-call Load from
+        // a post-call Load. Guest calls may write heap memory and globals.
+        self.arena.bump_mem_gen();
+        self.arena.note_symbolic_store();
         let mut ret = None;
         for r in [
             Reg::Rax,
@@ -3369,6 +3614,8 @@ impl<'a> Emulator<'a> {
 
         let remap = self.arena.compact(&roots);
         let max_depth = self.arena.last_compaction_max_depth();
+        self.guest_call_results = self.guest_call_results.iter()
+            .filter_map(|old| remap.get(old).copied()).collect();
         self.state.remap_refs(&remap);
         for event in &mut self.events {
             event.remap_refs(&remap);
@@ -4473,30 +4720,98 @@ mod vmx_boxing_tests {
     }
 }
 
-/// Whether `entry` is a routine that cannot return, by inspecting its body. Recognises the MSVC noreturn wrapper: straight-line setup, a call, and `int3` in the slot where the return would land.
+/// Recognize a bounded straight-line wrapper ending in an explicit trap under
+/// the existing non-resumable-trap CFG model. Each direct call may return, so
+/// inspect its fallthrough as well; never infer this property recursively from
+/// nested callees. The caller still emits its original complete native CALL,
+/// preserving the wrapper's setup, calls and exception effects in original code.
 fn callee_never_returns(pe: &PeFile, entry: u64) -> bool {
+    let Some(section) = pe.section_for_va(entry).filter(|s| s.is_executable()) else {
+        return false;
+    };
     let mut ip = entry;
     for _ in 0..NORETURN_SCAN_INSTRS {
         let Some(inst) = disasm::decode_at(pe, ip) else {
             return false;
         };
         let next = inst.next_ip();
+        // The whole instruction must remain in the original executable,
+        // file-backed section. A trap in another section is not this proof.
+        if next <= ip
+            || !pe.section_for_va(ip).is_some_and(|s| std::ptr::eq(s, section))
+            || !pe.section_for_va(next - 1).is_some_and(|s| std::ptr::eq(s, section))
+            || pe.read_va(ip, inst.len()).is_none_or(|bytes| bytes.len() != inst.len())
+        {
+            return false;
+        }
         match inst.mnemonic() {
-            // The shape being looked for: a call whose return slot is a trap.
-            Mnemonic::Call => {
-                return disasm::decode_at(pe, next).is_some_and(|i| i.mnemonic() == Mnemonic::Int3);
-            }
-            // Reached a trap without an intervening call: still cannot return.
             Mnemonic::Int3 | Mnemonic::Ud2 => return true,
-            // A return path exists, or control leaves in a way this scan cannot
-            // follow. Either way the straight-line assumption is broken.
-            Mnemonic::Ret | Mnemonic::Jmp => return false,
-            m if jcc_cc(m).is_some() => return false,
-            _ => ip = next,
+            Mnemonic::Call => {
+                if inst.op0_kind() != OpKind::NearBranch64
+                    || !disasm::direct_target(&inst).is_some_and(|target| {
+                        pe.is_executable(target) && !(entry..=ip).contains(&target)
+                    })
+                {
+                    return false;
+                }
+            }
+            // This also excludes LOOP/JRCXZ, far/indirect transfers, syscall
+            // and transactional transfers, not just the common Jcc mnemonics.
+            Mnemonic::Hlt => return false,
+            _ if inst.flow_control() != iced_x86::FlowControl::Next => return false,
+            _ => {}
+        }
+        ip = next;
+    }
+    false
+}
+
+/// Positive proof that native bytes may observe incoming RAX: either a read
+/// before any write, or a RET path on which it was never written. This only adds
+/// a real CALL input; it does not summarize the result, remove the call, prune
+/// failure paths, or assume that every path preserves RAX.
+fn callee_observes_incoming_rax(pe: &PeFile, entry: u64, vm: (u64, u64)) -> bool {
+    use iced_x86::FlowControl as F;
+    let mut pending = vec![(entry, 0xffu32)];
+    let mut seen = HashSet::new();
+    let mut factory = InstructionInfoFactory::new();
+    while let Some((ip, mut live)) = pending.pop() {
+        if live == 0 || !seen.insert((ip, live)) { continue; }
+        if seen.len() > 512 { return false; }
+        if !pe.is_executable(ip) || (vm.0..vm.1).contains(&ip) { continue; }
+        let Some(inst) = disasm::decode_at(pe, ip) else { continue; };
+        let info = factory.info(&inst);
+        let zero = matches!(inst.mnemonic(), Mnemonic::Xor | Mnemonic::Sub)
+            && inst.op0_kind() == OpKind::Register && inst.op1_kind() == OpKind::Register
+            && inst.op0_register() == inst.op1_register();
+        for use_ in info.used_registers() {
+            if let Some((Reg::Rax, offset, width)) = decode_reg(use_.register()) {
+                let mask = ((1u32 << width.bytes()) - 1) << offset;
+                if !zero && live & mask != 0 && matches!(use_.access(),
+                    OpAccess::Read | OpAccess::CondRead | OpAccess::ReadWrite | OpAccess::ReadCondWrite)
+                { return true; }
+                if matches!(use_.access(), OpAccess::Write | OpAccess::ReadWrite) {
+                    live &= if width.bytes() >= 4 { 0 } else { !mask };
+                }
+            }
+        }
+        if live == 0 { continue; }
+        match inst.flow_control() {
+            F::Return => return true,
+            F::Next => pending.push((inst.next_ip(), live)),
+            F::ConditionalBranch => {
+                pending.push((inst.next_ip(), live));
+                if let Some(target) = disasm::direct_target(&inst) { pending.push((target, live)); }
+            }
+            F::UnconditionalBranch => {
+                if let Some(target) = disasm::direct_target(&inst) { pending.push((target, live)); }
+            }
+            _ => {}
         }
     }
     false
 }
+
 
 #[cfg(test)]
 mod vm_return_tests {
@@ -4529,6 +4844,24 @@ mod vm_return_tests {
             section_alignment: 0x1000,
             size_of_headers: 0x200,
             loader_bound: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn frame_alias_review_native_rax_inputs_follow_real_bytes_and_partial_writes() {
+        for (code,expected) in [
+            (&[0xc3][..],true),
+            (&[0x31,0xc0,0xc3][..],false),
+            (&[0x48,0x89,0xc1,0x31,0xc0,0xc3][..],true),
+            (&[0xb0,0x42,0xc3][..],true),
+            (&[0x66,0x31,0xc0,0xc3][..],true),
+            (&[0x85,0xc9,0x75,0x01,0xc3,0x31,0xc0,0xc3][..],true),
+            (&[0xeb,0xfe][..],false),
+            (&[0xcc][..],false),
+        ] {
+            let pe=fixture(code,".text");
+            assert_eq!(callee_observes_incoming_rax(&pe,ENTRY,(0,0)),expected,"{code:02x?}");
+            assert!(!callee_observes_incoming_rax(&pe,ENTRY,(ENTRY,ENTRY+0x100)));
         }
     }
 

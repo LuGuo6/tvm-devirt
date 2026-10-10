@@ -161,9 +161,10 @@ pub fn unwind_info(prologue: &[PrologueInstr]) -> Vec<u8> {
 
     debug_assert_eq!(codes.len() % 2, 0, "unwind codes are two-byte slots");
     let mut info = Vec::with_capacity(4 + codes.len() + 2);
-    // Version 1, no flags: no exception or termination handler, and no chaining. The
-    // devirtualized body has no `try` regions of its own; any handler the original
-    // function had lives in the caller's scope table, which we do not touch.
+    // Version 1, no flags: describe stack unwinding only. Original functions can
+    // have their own exception/termination handlers and chained records. Those
+    // PC scopes, frame locals and cleanup states are not translated here;
+    // retaining the old records does not cover PCs in this generated body.
     info.push(UNWIND_VERSION_1);
     info.push(prolog_size);
     info.push((codes.len() / 2) as u8);

@@ -585,17 +585,29 @@ pub(crate) fn emit_branch_jcc(
                 }
             }
         } else {
-            // Generic: test the control value and jump if non-zero.
-            let ctrl_r = match resolve(alloc, ctrl, end) {
-                Some(Loc::Reg(r)) => r,
-                _ => {
-                    if let Some(lbl) = taken_lbl {
-                        asm.jmp(lbl)?;
+            // A spilled predicate is still a runtime condition. Read its own
+            // width directly in memory, preserving boundary-move registers.
+            match resolve(alloc, ctrl, end) {
+                Some(Loc::Reg(r)) => emit_test_self(asm, r, control_width(b, ctrl))?,
+                Some(Loc::Spill(slot)) => {
+                    let d = layout.spill_disp(slot) as i32;
+                    match control_width(b, ctrl) {
+                        Width::W8 => asm.cmp(byte_ptr(rsp+d), 0)?,
+                        Width::W16 => asm.cmp(word_ptr(rsp+d), 0)?,
+                        Width::W32 => asm.cmp(dword_ptr(rsp+d), 0)?,
+                        Width::W64 => asm.cmp(qword_ptr(rsp+d), 0)?,
                     }
-                    return Ok(());
                 }
-            };
-            emit_test_self(asm, ctrl_r, control_width(b, ctrl))?;
+                None => {
+                    if let Operand::Imm(value) = ctrl {
+                        if let Some(label) = if *value != 0 { taken_lbl } else { not_taken_lbl } {
+                            asm.jmp(label)?;
+                        }
+                        return Ok(());
+                    }
+                    bail!("branch predicate has no allocated location: {ctrl:?}");
+                }
+            }
             if let Some(lbl) = taken_lbl {
                 asm.jne(lbl)?;
             }

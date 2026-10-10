@@ -1,6 +1,7 @@
 //! Write recovered functions into the PE, then patch each entry trampoline to jmp to its recovered counterpart.
 
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::binary::pe::PeFile;
@@ -26,6 +27,15 @@ pub struct DevirtReport {
     pub pdata_entries: usize,
     pub pdata_added: usize,
     pub checksum: u32,
+}
+
+/// A swallowed entry whose original body is only INT3 padding.  There is no
+/// room for the normal five-byte near jump, so the entry gets a two-byte short
+/// jump to a five-byte E9 relay in a separately proven INT3 padding gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RelayPatch {
+    entry_va: u64,
+    relay_va: u64,
 }
 
 impl DevirtReport {
@@ -111,54 +121,207 @@ fn patchable_entries(
     source: &PeFile,
     selected: &[VmEntry],
     vm_section: &str,
-) -> (Vec<VmEntry>, Vec<(u64, String)>) {
+) -> (Vec<VmEntry>, Vec<(u64, String)>, Vec<RelayPatch>) {
     let all_entries = discover::find_vm_entries(source, vm_section);
     let functions = source.function_table();
+    let padding = all_entries
+        .iter()
+        .filter(|e| e.int3_padding > 0)
+        .map(|e| (e.trampoline_va + 5, e.trampoline_va + 5 + e.int3_padding as u64))
+        .collect::<Vec<_>>();
     let mut accepted = Vec::new();
     let mut rejected = Vec::new();
+    let mut relays = Vec::new();
+    let mut relay_by_vm = Vec::<(u64, u64)>::new();
+    let mut reserved_relays = Vec::<(u64, u64)>::new();
+    let mut function_ends = HashMap::<u64, u64>::new();
+    for &(begin, end) in &functions {
+        function_ends.entry(begin).and_modify(|stop| *stop = (*stop).min(end)).or_insert(end);
+    }
+
+    // Return the runtime-function range beginning at an entry.  Swallowed
+    // aliases have a .pdata record but no E9 of their own; falling back to one
+    // byte keeps the range proof conservative for malformed records.
+    let function_range = |start: u64| -> (u64, u64) {
+        (start, function_ends.get(&start).copied().unwrap_or(start.saturating_add(1)))
+    };
+    let candidate_range = |entry: &VmEntry| -> (u64, u64) {
+        let (begin, function_end) = function_range(entry.trampoline_va);
+        let end = if source.read_u8(entry.trampoline_va) == Some(0xe9) {
+            entry.trampoline_va.saturating_add(5)
+        } else {
+            function_end.max(begin.saturating_add(1))
+        };
+        (begin, end)
+    };
+
+    // A relay is valid only in an actual E9-following INT3 padding run.  It
+    // must not overlap any .pdata function range or any discovered entry's
+    // five-byte patch window, and the short jump must reach it.
+    let find_relay = |entry: &VmEntry, reserved: &[(u64, u64)]| -> Option<u64> {
+        let start = entry.trampoline_va;
+        let patch_end = start.checked_add(2)?;
+        let sec = source.section_for_va(start)?;
+        if !sec.is_executable() {
+            return None;
+        }
+        let reach_lo = patch_end.saturating_sub(128);
+        let reach_hi = patch_end.saturating_add(127);
+        for &(pad_lo, pad_hi) in &padding {
+            let lo = pad_lo.max(reach_lo);
+            // rel8 constrains the start, while all five bytes must stay in padding.
+            let hi = pad_hi.min(reach_hi.saturating_add(5));
+            if hi < lo.saturating_add(5) {
+                continue;
+            }
+            let mut relay = lo;
+            while relay + 5 <= hi {
+                let rel = relay as i64 - patch_end as i64;
+                if !(-128..=127).contains(&rel) {
+                    relay += 1;
+                    continue;
+                }
+                if source.read_va(relay, 5) != Some(&[0xcc; 5][..]) {
+                    relay += 1;
+                    continue;
+                }
+                if functions
+                    .iter()
+                    .any(|&(begin, end)| relay < end && begin < relay + 5)
+                {
+                    relay += 1;
+                    continue;
+                }
+                if all_entries.iter().any(|other| {
+                    let (lo, candidate_end) = candidate_range(other);
+                    lo < relay + 5 && relay < candidate_end
+                }) {
+                    relay += 1;
+                    continue;
+                }
+                if reserved
+                    .iter()
+                    .any(|&(lo, hi)| relay < hi && lo < relay + 5)
+                {
+                    relay += 1;
+                    continue;
+                }
+                return Some(relay);
+            }
+        }
+        None
+    };
+
     for entry in selected {
         let start = entry.trampoline_va;
-        let reason = (|| {
+        let result = (|| {
             let Some(end) = start.checked_add(5) else {
-                return Some("redirect address overflows".to_string());
+                return Err("redirect address overflows".to_string());
             };
             let Some(rva) = source.va_to_rva(start) else {
-                return Some("redirect is outside the image".to_string());
+                return Err("redirect is outside the image".to_string());
             };
             let Some(section) = source.section_for_rva(rva) else {
-                return Some("redirect has no containing section".to_string());
+                return Err("redirect has no containing section".to_string());
             };
             let offset = (rva - section.virtual_address) as u64;
             if !section.is_executable()
                 || offset + 5 > section.raw_size as u64
                 || source.read_va(start, 5).is_none_or(|b| b.len() != 5)
             {
-                return Some("redirect needs five file-backed executable bytes".to_string());
+                return Err("redirect needs five file-backed executable bytes".to_string());
             }
-            if let Some(other) = all_entries.iter().find(|other| {
-                other.trampoline_va != start && other.trampoline_va.abs_diff(start) < 5
-            }) {
-                return Some(format!(
-                    "five-byte redirect overlaps entry {:#x}",
-                    other.trampoline_va
+
+            let (fn_begin, fn_stop) = function_range(start);
+            let first = source.read_u8(start).unwrap_or(0);
+
+            // A swallowed alias may use EB rel8 only when its own runtime
+            // function supplies two INT3 bytes.  This deliberately excludes
+            // one-byte .pdata entries: their second byte belongs to the next
+            // padding gap and no nearby five-byte relay is proven by this
+            // method.
+            if first == 0xcc && (2..5).contains(&fn_stop.saturating_sub(fn_begin)) {
+                if source.read_va(start, 2) != Some(&[0xcc; 2][..]) {
+                    return Err("short relay requires two original INT3 bytes".to_string());
+                }
+                if functions.iter().any(|&(begin, stop)| {
+                    (start < begin && begin < start + 2)
+                        || (begin <= start && start < stop && stop < start + 2)
+                }) || all_entries.iter().any(|other| {
+                    other.trampoline_va != start && {
+                        let (lo, hi) = candidate_range(other);
+                        start < hi && lo < start + 2
+                    }
+                }) {
+                    return Err("two-byte redirect overlaps a candidate or runtime boundary".to_string());
+                }
+                let relay = if let Some(&(_, relay)) = relay_by_vm.iter().find(|&&(vm, relay)| {
+                    vm == entry.vm_entry_va
+                        && (-128..=127).contains(&(relay as i64 - (start as i64 + 2)))
+                }) {
+                    relay
+                } else {
+                    let Some(relay) = find_relay(entry, &reserved_relays) else {
+                        return Err(
+                            "short relay has no reachable function-free INT3 padding".to_string(),
+                        );
+                    };
+                    reserved_relays.push((relay, relay + 5));
+                    relay_by_vm.push((entry.vm_entry_va, relay));
+                    relay
+                };
+                let rel = relay as i64 - (start as i64 + 2);
+                if !(-128..=127).contains(&rel) {
+                    return Err("short relay is outside rel8 range".to_string());
+                }
+                return Ok(Some(RelayPatch {
+                    entry_va: start,
+                    relay_va: relay,
+                }));
+            }
+
+            // A normal near jump is also safe for a swallowed record that has
+            // at least five original INT3 bytes in its own function. This is
+            // the ordinary E9 write path; EB is reserved for the true 2..4
+            // byte windows above.
+            let normal_e9_window = first == 0xe9
+                || (first == 0xcc
+                    && fn_stop.saturating_sub(fn_begin) >= 5
+                    && source.read_va(start, 5) == Some(&[0xcc; 5][..]));
+            if !normal_e9_window {
+                return Err(format!(
+                    "five-byte redirect crosses runtime function boundary {fn_begin:#x}..{fn_stop:#x}"
                 ));
             }
             if let Some(&(begin, stop)) = functions.iter().find(|&&(begin, stop)| {
                 (start < begin && begin < end) || (begin <= start && start < stop && stop < end)
             }) {
-                return Some(format!(
+                return Err(format!(
                     "five-byte redirect crosses runtime function boundary {begin:#x}..{stop:#x}"
                 ));
             }
-            None
+            if all_entries.iter().any(|other| {
+                other.trampoline_va != start
+                    && {
+                        let (other_begin, other_end) = candidate_range(other);
+                        start < other_end && other_begin < end
+                    }
+            }) {
+                return Err("five-byte redirect overlaps another candidate span".to_string());
+            }
+            Ok(None)
         })();
-        if let Some(reason) = reason {
-            rejected.push((start, reason));
-        } else {
-            accepted.push(*entry);
+        match result {
+            Ok(relay) => {
+                accepted.push(*entry);
+                if let Some(relay) = relay {
+                    relays.push(relay);
+                }
+            }
+            Err(reason) => rejected.push((start, reason)),
         }
     }
-    (accepted, rejected)
+    (accepted, rejected, relays)
 }
 
 /// Emit all devirtualizable functions and write a patched copy of the PE.
@@ -177,7 +340,10 @@ pub fn write_devirt(
     }
     // Exclude unsafe redirects before recovery and layout. In particular, a
     // rejected entry must never enter CallRedirects even if its CFG is complete.
-    let (entries, patch_failures) = patchable_entries(pe, entries, vm_section);
+    let (entries, patch_failures, relay_patches) = patchable_entries(pe, entries, vm_section);
+    if let Some(base) = patch_base {
+        validate_relay_base(base, &relay_patches)?;
+    }
     for (entry, reason) in &patch_failures {
         eprintln!("  patch {entry:#x}: rejected ({reason})");
     }
@@ -447,6 +613,49 @@ pub fn write_devirt(
     let new_size = align_up_u32(va_start + vsize, sa as u32);
     write_u32_at(&mut out, size_off, new_size);
 
+    // Install the five-byte E9 relays first.  They live only in INT3 padding
+    // proved by patchable_entries; the short entry jumps below then lands on
+    // these relays without touching an adjacent function.
+    for relay in &relay_patches {
+        let entry_idx = entries.iter().position(|e| e.trampoline_va == relay.entry_va)
+            .context("relay entry absent from recovery inventory")?;
+        if offsets[entry_idx].is_none() {
+            continue; // incomplete entries retain their original bytes
+        }
+        // Choose an actually emitted member, never a speculative layout-probe
+        // address or an incomplete canonical alias. Equal VM starts are the
+        // complete alias proof used by the recovery scanner.
+        let canonical = emitted_relay_target(
+            &entries, &relay_patches, &offsets, relay.relay_va, devirt_base_va,
+        )?;
+        let Some((target_entry_va, target_va)) = canonical else {
+            bail!("active relay {:#x} has no emitted target", relay.relay_va);
+        };
+        let relay_off = match pe
+            .va_to_rva(relay.relay_va)
+            .and_then(|rva| pe.section_for_rva(rva))
+            .map(|s| s.raw_address + (relay.relay_va - pe.image_base) as u32 - s.virtual_address)
+        {
+            Some(o) => o as usize,
+            None => bail!("relay {:#x} is outside the output image", relay.relay_va),
+        };
+        let rel = target_va as i64 - (relay.relay_va as i64 + 5);
+        if !(i32::MIN as i64..=i32::MAX as i64).contains(&rel) {
+            bail!(
+                "relay {:#x} cannot reach emitted body {target_va:#x}",
+                relay.relay_va
+            );
+        }
+        if std::env::var_os("TVM_MAP").is_some() {
+            eprintln!(
+                "RELAY {:#x} {:#x} {:#x} {:#x}",
+                relay.entry_va, relay.relay_va, target_entry_va, target_va
+            );
+        }
+        out[relay_off] = 0xe9;
+        write_u32_at(&mut out, relay_off + 1, rel as i32 as u32);
+    }
+
     // patch the trampolines.
     for (idx, entry) in entries.iter().enumerate() {
         let Some(off) = offsets[idx] else { continue };
@@ -457,16 +666,24 @@ pub fn write_devirt(
                 s.raw_address + (entry.trampoline_va - pe.image_base) as u32 - s.virtual_address
             }) {
             Some(o) => o as usize,
-            None => continue,
+            None => bail!("emitted entry {:#x} has no file mapping", entry.trampoline_va),
         };
 
         let devirt_va = devirt_base_va + off as u64;
         let tramp_va = entry.trampoline_va;
+        if let Some(relay) = relay_patches.iter().find(|r| r.entry_va == tramp_va) {
+            let rel = relay.relay_va as i64 - (tramp_va as i64 + 2);
+            if !(-128..=127).contains(&rel) {
+                bail!("entry {tramp_va:#x} cannot reach relay {:#x}", relay.relay_va);
+            }
+            out[tramp_off] = 0xeb;
+            out[tramp_off + 1] = rel as i8 as u8;
+            continue;
+        }
         // Patch: E9 <rel32> where rel32 = devirt_va - (tramp_va + 5)
         let rel: i64 = devirt_va as i64 - (tramp_va as i64 + 5);
         if rel < i32::MIN as i64 || rel > i32::MAX as i64 {
-            // More than 2 GiB away; can't use a rel32 JMP, Skip.
-            continue;
+            bail!("entry {tramp_va:#x} cannot reach emitted body {devirt_va:#x}");
         }
         out[tramp_off] = 0xE9;
         write_u32_at(&mut out, tramp_off + 1, rel as i32 as u32);
@@ -480,6 +697,31 @@ pub fn write_devirt(
     report.checksum = cksum;
 
     Ok((out, report))
+}
+
+/// Pick a relay destination only from output bodies that were actually
+/// emitted. An earlier alias may be incomplete or fail code generation; its
+/// missing offset must never become a speculative branch destination.
+fn emitted_relay_target(
+    entries: &[VmEntry],
+    relays: &[RelayPatch],
+    offsets: &[Option<u32>],
+    relay_va: u64,
+    body_base: u64,
+) -> Result<Option<(u64, u64)>> {
+    if entries.len() != offsets.len() {
+        bail!("relay recovery and emitted-offset inventories disagree");
+    }
+    for member in relays.iter().filter(|r| r.relay_va == relay_va) {
+        let idx = entries.iter().position(|e| e.trampoline_va == member.entry_va)
+            .with_context(|| format!("relay entry {:#x} absent from recovery inventory", member.entry_va))?;
+        if let Some(offset) = offsets[idx] {
+            let target = body_base.checked_add(offset as u64)
+                .context("emitted relay target address overflows")?;
+            return Ok(Some((member.entry_va, target)));
+        }
+    }
+    Ok(None)
 }
 
 fn validate_patch_base(source: &PeFile, base: &PeFile, vm_section: &str) -> Result<()> {
@@ -519,6 +761,28 @@ fn validate_patch_base(source: &PeFile, base: &PeFile, vm_section: &str) -> Resu
         read_exception_directory(base).into_iter().collect();
     if !old.iter().all(|r| preserved.contains(r)) {
         bail!("patch base does not preserve the original runtime function table");
+    }
+    Ok(())
+}
+
+/// This planner has no persistent ownership map for earlier relays. Therefore
+/// incremental relay sites must still be original INT3 bytes in the base.
+/// Even an E9 to a derived body might belong to an unselected alias; rejecting
+/// it avoids changing that alias's behavior by repurposing shared padding.
+fn validate_relay_base(base: &PeFile, relays: &[RelayPatch]) -> Result<()> {
+    for relay in relays {
+        let entry = base
+            .read_va(relay.entry_va, 2)
+            .with_context(|| format!("relay entry {:#x} is unreadable in patch base", relay.entry_va))?;
+        if entry != [0xcc, 0xcc] {
+            bail!("patch base short entry {:#x} is already occupied", relay.entry_va);
+        }
+        let body = base
+            .read_va(relay.relay_va, 5)
+            .with_context(|| format!("relay {:#x} is unreadable in patch base", relay.relay_va))?;
+        if body != [0xcc, 0xcc, 0xcc, 0xcc, 0xcc] {
+            bail!("patch base relay {:#x} is already occupied", relay.relay_va);
+        }
     }
     Ok(())
 }
@@ -575,7 +839,7 @@ fn prepare_recovered(entry_va: u64, cfg: ir::Cfg) -> PreparedFn {
 }
 
 /// Why a recovered graph cannot be retargeted, or `None` when it can.
-fn why_incomplete(cfg: &ir::Cfg) -> Option<String> {
+pub(crate) fn why_incomplete(cfg: &ir::Cfg) -> Option<String> {
     if cfg.blocks.is_empty() {
         return Some("no blocks recovered".to_string());
     }
@@ -584,6 +848,13 @@ fn why_incomplete(cfg: &ir::Cfg) -> Option<String> {
     }
     if cfg.unresolved != 0 {
         return Some(format!("{} block(s) never resolved", cfg.unresolved));
+    }
+    for block in &cfg.blocks {
+        for event in &block.events {
+            if let crate::ir::lift::Event::Call { target: None, import_slot: None, site, .. } = event {
+                return Some(format!("unknown call target at {site:#x}"));
+            }
+        }
     }
     let issues = explore::validate(cfg);
     if !issues.is_clean() {
@@ -631,7 +902,7 @@ mod preparation_tests {
             back_edges: vec![],
             trivial_phis_removed: 0,
             stack_base: crate::vm::DEFAULT_STACK_BASE,
-            vm_range: (0, 0),
+            native_entry_proofs: Default::default(), vm_range: (0, 0),
         }
     }
 
@@ -680,7 +951,6 @@ mod preparation_tests {
 mod patch_boundary_tests {
     use super::*;
     use crate::binary::pe::Section;
-    use iced_x86::{Decoder, DecoderOptions, FlowControl};
 
     const BASE: u64 = 0x180000000;
     const TEXT: u64 = BASE + 0x1000;
@@ -769,14 +1039,20 @@ mod patch_boundary_tests {
             vec![TEXT, TEXT + 5, TEXT + 7, TEXT + 0x20]
         );
         for selected in [all[1], all[2]] {
-            let (accepted, rejected) = patchable_entries(&pe, &[selected], ".tvm0");
-            assert!(accepted.is_empty());
-            assert_eq!(rejected.len(), 1);
-            assert!(rejected[0].1.contains("overlaps entry"));
+            let (accepted, rejected, relays) = patchable_entries(&pe, &[selected], ".tvm0");
+            assert_eq!(accepted.len(), 1);
+            assert!(rejected.is_empty());
+            if selected.trampoline_va == TEXT + 5 {
+                assert_eq!(relays.len(), 1);
+                assert_eq!(relays[0].entry_va, selected.trampoline_va);
+            } else {
+                assert!(relays.is_empty());
+            }
         }
-        let (accepted, rejected) = patchable_entries(&pe, &[all[0], all[3]], ".tvm0");
+        let (accepted, rejected, relays) = patchable_entries(&pe, &[all[0], all[3]], ".tvm0");
         assert_eq!(accepted.len(), 2);
         assert!(rejected.is_empty());
+        assert!(relays.is_empty());
     }
 
     #[test]
@@ -789,47 +1065,147 @@ mod patch_boundary_tests {
         write_u32_at(&mut pe.data, dir + 4, 2 * fmt::RUNTIME_FUNCTION_SIZE as u32);
         pe.data[0x418..0x430].fill(0);
         let all = discover::find_vm_entries(&pe, ".tvm0");
-        let (accepted, rejected) = patchable_entries(&pe, &[all[1]], ".tvm0");
+        // A one-byte runtime function has no two-byte entry sequence for EB;
+        // keep it rejected even though the following padding is INT3.
+        write_u32_at(&mut pe.data, 0x410, 0x1006);
+        let (accepted, rejected, _) = patchable_entries(&pe, &[all[1]], ".tvm0");
         assert!(accepted.is_empty());
-        assert!(rejected[0].1.contains("runtime function boundary"));
+        assert!(rejected[0].1.contains("five-byte redirect crosses"));
         let beyond = VmEntry {
             trampoline_va: TEXT + 0xfc,
             vm_entry_va: VM,
             int3_padding: 0,
         };
-        let (accepted, rejected) = patchable_entries(&pe, &[beyond], ".tvm0");
+        let (accepted, rejected, _) = patchable_entries(&pe, &[beyond], ".tvm0");
         assert!(accepted.is_empty());
         assert!(rejected[0].1.contains("five file-backed executable bytes"));
     }
 
     #[test]
-    fn rejected_aliases_are_not_written_or_used_as_call_redirects() {
+    fn rejected_alias_is_not_written_or_used_as_call_redirect() {
+        let mut pe = fixture();
+        // Make the swallowed alias a one-byte runtime function.  It remains a
+        // discovered VM entry, but there is no two-byte window for an EB
+        // redirect, so the call from the recovered VM body must keep its
+        // original target instead of following a speculative redirect.
+        write_u32_at(&mut pe.data, 0x410, 0x1006);
+        let all = discover::find_vm_entries(&pe, ".tvm0");
+        assert_eq!(all[1].trampoline_va, TEXT + 5);
+        let (out, report) = write_devirt(&pe, None, &all[..2], 100, 8, 5, ".tvm0", 1).unwrap();
+        assert_eq!(report.retargeted, 1);
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].0, TEXT + 5);
+        // The generated body starts at the aligned end of the last fixture
+        // section (file offset 0x1600, VA BASE+0x4000).  Decode its direct
+        // calls and prove the one targeting the rejected alias stayed at the
+        // original source address.
+        let mut decoder = iced_x86::Decoder::with_ip(
+            64,
+            &out[0x1600..0x1700],
+            BASE + 0x4000,
+            iced_x86::DecoderOptions::NONE,
+        );
+        let mut call_target = None;
+        while decoder.can_decode() {
+            let inst = decoder.decode();
+            if inst.is_invalid() {
+                break;
+            }
+            if inst.flow_control() == iced_x86::FlowControl::Call
+                && matches!(
+                    inst.op0_kind(),
+                    iced_x86::OpKind::NearBranch16
+                        | iced_x86::OpKind::NearBranch32
+                        | iced_x86::OpKind::NearBranch64
+                )
+            {
+                call_target = Some(inst.near_branch64());
+                break;
+            }
+        }
+        assert_eq!(call_target, Some(TEXT + 5));
+        // Only the real E9 trampoline was patched; the rejected one is still
+        // the original INT3 byte sequence.
+        assert_eq!(&out[0x205..0x207], &[0xcc, 0xcc]);
+    }
+
+    #[test]
+    fn shared_relay_uses_an_emitted_alias_as_its_canonical_target() {
+        let mut pe = fixture();
+        // Turn both swallowed records into two-byte aliases of the same VM
+        // entry.  They must share a relay while each emitted body receives a
+        // normal MAP/exception record.
+        write_u32_at(&mut pe.data, 0x41c, 0x1009);
+        let all = discover::find_vm_entries(&pe, ".tvm0");
+        let selected = [all[1], all[2]];
+        let (out, report) = write_devirt(&pe, None, &selected, 100, 8, 5, ".tvm0", 1).unwrap();
+        assert_eq!(report.retargeted, 2);
+        assert!(report.failed.is_empty());
+        assert_eq!(&out[0x205..0x207], &[0xeb, 0x02]);
+        // The second alias is two bytes too, and its shared relay starts at
+        // the same INT3 gap.  The relay must contain an E9 to an emitted body.
+        assert_eq!(out[0x209], 0xe9);
+        let rel = i32::from_le_bytes(out[0x20a..0x20e].try_into().unwrap());
+        assert_eq!(((TEXT + 0xe) as i64 + rel as i64) as u64, BASE + 0x4000);
+        assert_eq!(&out[0x207..0x209], &[0xeb, 0x00]);
+    }
+
+    #[test]
+    fn relay_target_skips_unemitted_canonical_alias_and_rejects_missing_inventory() {
+        let mut pe = fixture();
+        write_u32_at(&mut pe.data, 0x41c, 0x1009);
+        let all = discover::find_vm_entries(&pe, ".tvm0");
+        let selected = [all[1], all[2]];
+        let (_, _, relays) = patchable_entries(&pe, &selected, ".tvm0");
+        assert_eq!(relays.len(), 2);
+        let relay = relays[0].relay_va;
+        assert_eq!(relays[1].relay_va, relay);
+        assert_eq!(
+            emitted_relay_target(&selected, &relays, &[None, Some(0x20)], relay, BASE + 0x4000).unwrap(),
+            Some((TEXT + 7, BASE + 0x4020)),
+        );
+        assert_eq!(
+            emitted_relay_target(&selected, &relays, &[None, None], relay, BASE + 0x4000).unwrap(),
+            None,
+        );
+        assert!(emitted_relay_target(&selected[1..], &relays, &[Some(0)], relay, BASE + 0x4000).is_err());
+    }
+
+    #[test]
+    fn incomplete_alias_keeps_entry_and_relay_padding_untouched() {
         let pe = fixture();
         let all = discover::find_vm_entries(&pe, ".tvm0");
-        let (out, report) = write_devirt(&pe, None, &all[..3], 100, 8, 5, ".tvm0", 1).unwrap();
-        assert_eq!(report.total(), 3);
-        assert_eq!(report.retargeted, 1);
-        assert_eq!(report.failed.len(), 2);
-        assert_eq!(report.pdata_added, 1);
-        assert_eq!(&out[0x205..0x300], &pe.data[0x205..0x300]);
-        let rel = i32::from_le_bytes(out[0x201..0x205].try_into().unwrap());
-        let body_va = TEXT.wrapping_add(5).wrapping_add_signed(rel as i64);
-        let body_off = 0x600 + (body_va - VM) as usize;
-        let decoder = Decoder::with_ip(
-            64,
-            &out[body_off..body_off + 128],
-            body_va,
-            DecoderOptions::NONE,
-        );
-        let calls: Vec<_> = decoder
-            .into_iter()
-            .filter(|i| i.flow_control() == FlowControl::Call)
-            .map(|i| i.near_branch_target())
-            .collect();
-        assert_eq!(
-            calls,
-            vec![TEXT + 5],
-            "a rejected alias must retain its source address"
-        );
+        let (_, _, relays) = patchable_entries(&pe, &all[1..2], ".tvm0");
+        assert_eq!(relays.len(), 1);
+        let (out, report) = write_devirt(&pe, None, &all[1..2], 0, 8, 5, ".tvm0", 1).unwrap();
+        assert_eq!(report.retargeted, 0);
+        assert_eq!(report.incomplete.len(), 1);
+        assert_eq!(&out[0x200..0x300], &pe.data[0x200..0x300]);
+    }
+
+    #[test]
+    fn patch_base_relay_bytes_are_checked_before_reuse() {
+        let mut base = fixture();
+        let relay_va = TEXT + 0x28;
+        let relay_off = 0x200 + 0x28;
+        let entry_off = 0x205;
+        let planned = [RelayPatch {
+            entry_va: TEXT + 5,
+            relay_va,
+        }];
+        // An untouched patch base is reusable. Any existing short jump or
+        // relay bytes are treated as occupied because ownership of an earlier
+        // relay is not persisted in the PE.
+        assert!(validate_relay_base(&base, &planned).is_ok());
+        let entry_rel = (relay_va as i64 - (TEXT + 5 + 2) as i64) as i8 as u8;
+        base.data[entry_off..entry_off + 2].copy_from_slice(&[0xeb, entry_rel]);
+        assert!(validate_relay_base(&base, &planned).is_err());
+        base = fixture();
+        base.data[relay_off] = 0xe9;
+        write_u32_at(&mut base.data, relay_off + 1, 0x3000);
+        assert!(validate_relay_base(&base, &planned).is_err());
+        base = fixture();
+        base.data[relay_off] = 0x90;
+        assert!(validate_relay_base(&base, &planned).is_err());
     }
 }

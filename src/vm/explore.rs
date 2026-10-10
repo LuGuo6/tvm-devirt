@@ -1,11 +1,30 @@
-//! CFG recovery by state forking at virtualized branches. Evaluation of a single path stops as soon as an indirect branch depends on a guest value.
+#[cfg(test)]
+#[path = "native_prefix_identity_tests.rs"]
+mod native_prefix_identity_tests;
+
+// CFG recovery by state forking at virtualized branches. Evaluation of a single path stops as soon as an indirect branch depends on a guest value.
+
+#[cfg(test)]
+#[path = "location_flow_tests.rs"]
+mod location_flow_tests;
+
+#[cfg(test)]
+#[path = "native_join_tests.rs"]
+mod native_join_tests;
+
+#[cfg(test)]
+#[path = "jump_queue_tests.rs"]
+mod jump_queue_tests;
 
 use crate::binary::pe::PeFile;
 use crate::ir::expr::render;
 use crate::ir::expr::{self, Arena, Op, Ref, Reg, Width};
-use crate::ir::lift::{Emulator, Event, Stop};
+use crate::ir::lift::{ContextIdentity, Emulator, Event, LocationHomePlan, NativeJoinPlan, Stop};
 use crate::ir::{Block, BlockId, Cfg, Terminator, terminator_kind};
 use std::collections::{HashMap, HashSet};
+
+#[path = "wide_range.rs"]
+mod wide_range;
 
 /// A pending continuation: a live evaluator plus where it resumes.
 struct Task<'a> {
@@ -19,10 +38,171 @@ struct Task<'a> {
     id: BlockId,
     /// Predecessor block, for edge bookkeeping.
     from: Option<BlockId>,
+    /// The exact parent exit snapshot, captured before this evaluator is cloned.
+    /// References still belong to this clone's arena; never compare their numeric
+    /// identities with those of another incoming evaluator.
+    incoming_homes: Option<Vec<(Reg, Ref)>>,
     /// Blocks on the path from the function entry to this task. Only a jump back
     /// to an *ancestor* is a loop; a jump to an already-recovered block that is
     /// not an ancestor is ordinary convergence (the join of an if/else diamond).
     ancestors: Vec<BlockId>,
+}
+
+/// Concrete interpreter locations may be used as a block's frame only when
+/// every incoming path agrees. Observations precede visited-node pruning, and
+/// a disagreement remains fatal even when a later edge matches the first one.
+#[derive(Default)]
+struct IncomingContexts {
+    first: HashMap<BlockId, Result<Option<ContextIdentity>, ()>>,
+    rejected: HashSet<BlockId>,
+}
+
+impl IncomingContexts {
+    fn observe(&mut self, block: BlockId, context: Result<Option<ContextIdentity>, ()>) {
+        let first = self.first.entry(block).or_insert(context);
+        if context.is_err() || *first != context {
+            self.rejected.insert(block);
+        }
+    }
+}
+
+/// All paths must reach this handler with a complete native prefix. Late
+/// predecessors and explicit backedges can revoke the first path's proof.
+#[derive(Default)]
+struct IncomingNativePrefixes { proven: HashMap<BlockId, bool> }
+impl IncomingNativePrefixes {
+    fn observe(&mut self, block: BlockId, proven: bool) {
+        self.proven.entry(block).and_modify(|old| *old &= proven).or_insert(proven);
+    }
+
+    fn all_paths(&self, blocks: &[Block], entry: BlockId) -> HashSet<BlockId> {
+        let mut proven: HashSet<_> = self.proven.iter()
+            .filter_map(|(&id, &ok)| ok.then_some(id)).collect();
+        // A late incoming can invalidate an already visited ancestor. Its first
+        // evaluator may already have produced native-looking descendants, so
+        // propagate the revocation through the completed predecessor graph.
+        loop {
+            let revoke: Vec<_> = blocks.iter().filter(|block| {
+                proven.contains(&block.id) && block.id != entry
+                    && (block.preds.is_empty()
+                        || block.preds.iter().any(|pred| !proven.contains(pred)))
+            }).map(|block| block.id).collect();
+            if revoke.is_empty() { break; }
+            for id in revoke { proven.remove(&id); }
+        }
+        proven
+    }
+}
+
+#[derive(Default)]
+struct IncomingLocationHomes {
+    plans: HashMap<BlockId, LocationHomePlan>,
+    rejected: HashMap<BlockId, String>,
+}
+
+#[derive(Default)]
+struct IncomingNativeHomes {
+    plans: HashMap<BlockId, NativeJoinPlan>,
+    rejected: HashMap<BlockId, String>,
+}
+
+impl IncomingNativeHomes {
+    fn observe(&mut self, block: BlockId, emu: &Emulator<'_>, homes: Option<&[(Reg,Ref)]>) {
+        let result = match homes {
+            None => Err("native edge has no proven parent machine snapshot".into()),
+            Some(homes) => match self.plans.get_mut(&block) {
+                Some(plan) => plan.validate(emu,homes),
+                None => NativeJoinPlan::discover(emu,homes,block.handler)
+                    .map(|plan| { self.plans.insert(block,plan); }),
+            },
+        };
+        if let Err(reason) = result {
+            self.rejected.entry(block).or_insert(reason);
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct LocationObservation {
+    block: BlockId,
+    from: Option<BlockId>,
+    late: bool,
+    backedge: bool,
+    homes: Vec<(Reg, String)>,
+    rejected: bool,
+}
+
+impl IncomingLocationHomes {
+    fn observe(&mut self, block: BlockId, emu: &mut Emulator<'_>, homes: Option<&[(Reg,Ref)]>, value_sets: &[(Ref,u64)]) {
+        let result = match homes {
+            None => Err("incoming edge has no captured parent exit homes".to_string()),
+            Some(homes) => match self.plans.get_mut(&block) {
+                Some(plan) => plan.validate(emu,homes,value_sets),
+                None => LocationHomePlan::discover(emu,homes,value_sets).map(|plan| { self.plans.insert(block,plan); }),
+            },
+        };
+        if let Err(reason) = result {
+            if !self.rejected.contains_key(&block) {
+                eprintln!("     diagnostic location-home rejection at {block}: {reason}");
+                self.rejected.insert(block,reason);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod incoming_context_tests {
+    use super::*;
+
+    fn join() -> BlockId { BlockId { handler: 0x1200, vip: Some(0x4500) } }
+    fn image() -> ContextIdentity {
+        ContextIdentity { base: 0x7fff00001000, layout_index: 0, guest_rsp: 0x7fff00002000 }
+    }
+
+    #[test]
+    fn late_predecessor_or_backedge_cannot_change_the_seeded_frame() {
+        let original = image();
+        for changed in [
+            ContextIdentity { base: original.base + 0x90, ..original },
+            ContextIdentity { layout_index: 1, ..original },
+            ContextIdentity { guest_rsp: original.guest_rsp + 8, ..original },
+        ] {
+            let mut incoming = IncomingContexts::default();
+            // The first path has already allowed this join to be recovered.
+            incoming.observe(join(), Ok(Some(original)));
+            assert!(incoming.rejected.is_empty());
+            // A late edge still invalidates the graph. A subsequent matching
+            // edge must not hide that disagreement or resurrect emission.
+            incoming.observe(join(), Ok(Some(changed)));
+            incoming.observe(join(), Ok(Some(original)));
+            assert_eq!(incoming.rejected, HashSet::from([join()]));
+        }
+    }
+
+    #[test]
+    fn missing_context_on_one_incoming_is_not_a_proof_for_all_paths() {
+        for missing in [Ok(None), Err(())] {
+            for reverse in [false, true] {
+                let mut paths = [Ok(Some(image())), missing];
+                if reverse { paths.reverse(); }
+                let mut incoming = IncomingContexts::default();
+                for context in paths { incoming.observe(join(), context); }
+                assert!(incoming.rejected.contains(&join()));
+            }
+        }
+    }
+
+    #[test]
+    fn agreeing_incoming_frames_and_context_free_native_blocks_remain_valid() {
+        let mut incoming = IncomingContexts::default();
+        let native = BlockId { handler: 0x2400, vip: None };
+        for _ in 0..3 {
+            incoming.observe(join(), Ok(Some(image())));
+            incoming.observe(native, Ok(None));
+        }
+        assert!(incoming.rejected.is_empty());
+    }
 }
 
 /// Run a block while keeping its entry parameters valid across arena compaction.
@@ -45,6 +225,53 @@ fn run_retaining_entry_params(
     stop
 }
 
+/// Cut already-produced values at their proven guest-register homes while
+/// grafting a block.  Opaque IDs belong to the evaluator arena and are not a
+/// cross-block identity; the snapshot and this block's effects must share this
+/// memo.  Equal values in several registers need only one deterministic home.
+fn graft_entry_homes(
+    arena: &mut expr::Arena,
+    src: &expr::Arena,
+    block: expr::BlockRef,
+    snapshot: &[(Reg, Ref)],
+    memo: &mut HashMap<Ref, Ref>,
+) -> Vec<(Reg, Ref)> {
+    let mut ordered = snapshot.to_vec();
+    ordered.sort_by_key(|(reg, _)| *reg as u8);
+    let mut params = Vec::new();
+    for (reg, value) in ordered {
+        // A native/guest snapshot may contain ABI-undefined call outputs. Their
+        // physical register at an earlier block boundary is not a saved result.
+        // Keep their leaves visible so a live use is rejected by codegen.
+        if NativeJoinPlan::contains_uncaptured_call_output(src, value) {
+            continue;
+        }
+        if matches!(src.op(value), Op::Param(owner, r) if *owner == block && *r == reg) {
+            // Join recovery already seeded these exact parameters. RSP is a
+            // frame anchor, but its seeded declaration/phi must still survive.
+            let parameter = arena.graft(src, value, memo);
+            params.push((reg, parameter));
+            continue;
+        }
+        if reg == Reg::Rsp || memo.contains_key(&value) {
+            continue;
+        }
+        // Preserve the existing constant/function-entry lowering here. Loads,
+        // call/boxed results and prior block parameters describe a past value;
+        // those need a physical home. Reconstructing InitReg expressions still
+        // depends on the scheduler finding a live function-entry register home.
+        if !expr::leaves(src, value).iter().any(|leaf| {
+            matches!(src.op(*leaf), Op::Load(..) | Op::Opaque(..) | Op::Param(..))
+        }) {
+            continue;
+        }
+        let parameter = arena.param(block, reg);
+        memo.insert(value, parameter);
+        params.push((reg, parameter));
+    }
+    params
+}
+
 #[cfg(test)]
 mod divergence_root_tests {
     use super::*;
@@ -52,6 +279,28 @@ mod divergence_root_tests {
     use crate::ir::expr::{Arena, Reg, Width};
     use crate::vm::state::State;
     use std::collections::HashSet;
+
+    #[test]
+    fn entry_home_graft_keeps_seeded_rsp_and_does_not_equate_arena_opaque_ids() {
+        let mut src = Arena::new();
+        let old_result = src.opaque("call_ret", Width::W64);
+        let later_result = src.opaque("call_ret", Width::W64);
+        let own_rsp = src.param(expr::BlockRef(3), Reg::Rsp);
+        let mut arena = Arena::new();
+        // This has the same numeric opaque ID as src.old_result, but no origin
+        // relationship to it. Only the shared source memo supplies that proof.
+        let unrelated = arena.opaque("call_ret", Width::W64);
+        let mut memo = HashMap::new();
+        let params = graft_entry_homes(&mut arena, &src, expr::BlockRef(3),
+            &[(Reg::Rdi, old_result), (Reg::Rax, later_result), (Reg::R12, old_result), (Reg::Rsp, own_rsp)], &mut memo);
+        let object = arena.graft(&src, old_result, &mut memo);
+        let later = arena.graft(&src, later_result, &mut memo);
+        assert_eq!(arena.op(object), &Op::Param(expr::BlockRef(3), Reg::Rdi));
+        assert_eq!(arena.op(later), &Op::Param(expr::BlockRef(3), Reg::Rax));
+        assert_ne!(object, unrelated);
+        assert_eq!(params.iter().filter(|(_, p)| *p == object).count(), 1);
+        assert!(params.iter().any(|(r, p)| *r == Reg::Rsp && arena.op(*p) == &Op::Param(expr::BlockRef(3), Reg::Rsp)));
+    }
 
     #[test]
     fn divergence_roots_include_state_and_active_pins() {
@@ -143,6 +392,13 @@ pub struct Explorer<'a> {
 
     /// Name of the section holding VM bytecode.
     vm_section: String,
+    // Tests still execute the actual work queue, x86 evaluator and CFG path.
+    #[cfg(test)]
+    test_seed: Option<Emulator<'a>>,
+    #[cfg(test)]
+    location_observations: std::cell::RefCell<Vec<LocationObservation>>,
+    #[cfg(test)]
+    location_exit_snapshots: std::cell::RefCell<HashMap<BlockId, (Vec<(Reg,String)>, Vec<(Reg,String)>)>>,
 }
 
 impl<'a> Explorer<'a> {
@@ -156,6 +412,12 @@ impl<'a> Explorer<'a> {
             work_budget: 24_000_000,
             verbose: false,
             vm_section: crate::vm::DEFAULT_VM_SECTION.to_string(),
+            #[cfg(test)]
+            test_seed: None,
+            #[cfg(test)]
+            location_observations: std::cell::RefCell::new(Vec::new()),
+            #[cfg(test)]
+            location_exit_snapshots: std::cell::RefCell::new(HashMap::new()),
         }
     }
 
@@ -215,12 +477,29 @@ impl<'a> Explorer<'a> {
             return first;
         }
         let mut cfg = self.recover_pass_with(start, &joins, Some(&first), vip_slot, None);
+        // A late-discovered join was evaluated from only one incoming snapshot.
+        // Do not publish that path's entry homes as valid for all predecessors.
+        let new_joins = join_blocks(&cfg);
+        if !new_joins.is_subset(&joins) {
+            cfg.unresolved += new_joins.difference(&joins).count();
+        }
         cfg.trivial_phis_removed = cfg.simplify_phis();
         cfg.remove_dead_params();
         cfg
     }
 
     pub const VIP_PROBE_STEPS: usize = 20_000;
+
+    #[cfg(test)]
+    fn record_location_observation(&self, task: &Task<'_>, block: BlockId,
+        from: Option<BlockId>, late: bool, backedge: bool, incoming: &IncomingLocationHomes)
+    {
+        let homes = task.incoming_homes.iter().flatten()
+            .map(|&(reg,value)| (reg,expr::render(&task.emu.arena,value,12))).collect();
+        self.location_observations.borrow_mut().push(LocationObservation {
+            block, from, late, backedge, homes, rejected: incoming.rejected.contains_key(&block),
+        });
+    }
 
     /// One recovery pass, optionally guided by the structure an earlier pass found. `known` decouples control-flow recovery from data-flow recovery.
     fn recover_pass_with(
@@ -249,11 +528,17 @@ impl<'a> Explorer<'a> {
         let mut total_steps = 0usize;
         let mut timed_out = false;
         let mut unresolved = 0usize;
+        let mut incoming_contexts = IncomingContexts::default();
+        let mut incoming_prefixes = IncomingNativePrefixes::default();
+        let mut incoming_locations = IncomingLocationHomes::default();
+        let mut incoming_native = IncomingNativeHomes::default();
 
         let mut queue: Vec<Task> = vec![Task {
             value_sets: Vec::new(),
             emu: {
                 let mut e = Emulator::with_vm_section(self.pe, self.stack_base, &self.vm_section);
+                #[cfg(test)]
+                if let Some(seed) = &self.test_seed { e = seed.clone(); }
                 // Forks clone the evaluator, so setting this on the seed reaches every
                 // block in the pass.
                 e.vip_slot = vip_slot;
@@ -262,6 +547,7 @@ impl<'a> Explorer<'a> {
             resume: start,
             id: entry_id,
             from: None,
+            incoming_homes: None,
             ancestors: Vec::new(),
         }];
 
@@ -301,6 +587,20 @@ impl<'a> Explorer<'a> {
             }
             if let Some(p) = task.from {
                 edges.push((p, task.id));
+            }
+            // A late predecessor or backedge still participates in the frame
+            // proof even though its destination has already been evaluated.
+            incoming_contexts.observe(task.id, task.emu.guest_context_identity());
+            incoming_prefixes.observe(task.id, task.id.vip.is_none()
+                && NativeJoinPlan::prefix_history(&task.emu));
+            if cut_at.contains(&task.id) && task.emu.guest_ctx.is_none()
+                && !task.emu.diagnostic_location_homes {
+                incoming_native.observe(task.id,&task.emu,task.incoming_homes.as_deref());
+            }
+            if task.emu.diagnostic_location_homes && cut_at.contains(&task.id) {
+                incoming_locations.observe(task.id, &mut task.emu, task.incoming_homes.as_deref(), &task.value_sets);
+                #[cfg(test)]
+                self.record_location_observation(&task, task.id, task.from, visited.contains(&task.id), false, &incoming_locations);
             }
             if !visited.insert(task.id) {
                 if let Some(p) = task.from {
@@ -344,7 +644,22 @@ impl<'a> Explorer<'a> {
                 // Symbolic stack writes from one incoming path are not memory
                 // phis. Keep them out of joins until memory SSA is available.
                 task.emu.state.forget_symbolic_memory();
-                task.emu.seed_guest_params(block_ref)
+                if task.emu.diagnostic_location_homes {
+                    if incoming_locations.rejected.contains_key(&task.id) { Vec::new() }
+                    else { incoming_locations.plans.get(&task.id).map(|plan| plan.seed(&mut task.emu,block_ref)).unwrap_or_default() }
+                } else if let Some(plan) = incoming_native.plans.get(&task.id) {
+                    task.value_sets.clear();
+                    if incoming_native.rejected.contains_key(&task.id) { Vec::new() }
+                    else { plan.seed(&mut task.emu,block_ref) }
+                } else { task.emu.seed_guest_params(block_ref) }
+            } else if task.from.is_some() {
+                // A single-predecessor block still has architectural entry
+                // homes.  Snapshot them without changing symbolic execution;
+                // the graft below cuts only the lowered expressions.  Never
+                // substitute the interpreter's physical registers here. Native
+                // snapshots only enter this field after a full machine-history
+                // proof, independent of whether a guest context was discovered.
+                task.incoming_homes.clone().unwrap_or_default()
             } else {
                 Vec::new()
             };
@@ -356,6 +671,16 @@ impl<'a> Explorer<'a> {
                 &mut entry_params,
                 &mut task.value_sets,
             );
+            // Bind definitions before any successor clones this evaluator.
+            // Full BlockId (including VIP) distinguishes shared handler sites;
+            // event position distinguishes repeated calls within this block.
+            for (event_index, event) in task.emu.events.iter().enumerate() {
+                if let Event::Call { ret: Some(ret), site, .. } = event {
+                    task.emu.arena.bind_call_origin(*ret, expr::CallOrigin {
+                        block: task.id, event_index, site: *site,
+                    });
+                }
+            }
             // Recorded before `stop` is consumed below.
             let returning = matches!(stop, Stop::Return { .. });
             let cost = task.emu.steps - before;
@@ -373,6 +698,21 @@ impl<'a> Explorer<'a> {
                 }
                 _ => false,
             };
+            // Read the architectural exit once, before split/adoption clones
+            // continuation states. Re-selecting a context after forking could
+            // give the parent and its children different register layouts.
+            task.emu.ctx_miss = None;
+            let exit_context = task.emu.guest_context_identity();
+            let guest = if returning || proven_native_tail || matches!(&stop, Stop::NoReturn { .. }) {
+                None
+            } else {
+                task.emu.guest_registers()
+            };
+            let native = NativeJoinPlan::snapshot(&mut task.emu);
+            task.incoming_homes = guest.clone().or(native);
+            #[cfg(test)]
+            let raw_exit_snapshot: Vec<_> = guest.iter().flatten()
+                .map(|&(reg,value)| (reg,expr::render(&task.emu.arena,value,12))).collect();
             let events = std::mem::take(&mut task.emu.events);
 
             // Locate the guest register image *before* the terminator is built.
@@ -447,6 +787,7 @@ impl<'a> Explorer<'a> {
                         resume: taken,
                         id: id_t,
                         from: Some(task.id),
+                        incoming_homes: task.incoming_homes.clone(),
                         ancestors: ancestors.clone(),
                     });
                     queue.push(Task {
@@ -455,6 +796,7 @@ impl<'a> Explorer<'a> {
                         resume: not_taken,
                         id: id_n,
                         from: Some(task.id),
+                        incoming_homes: task.incoming_homes.clone(),
                         ancestors,
                     });
                     Terminator::Branch {
@@ -560,10 +902,57 @@ impl<'a> Explorer<'a> {
                 }
             };
 
+            // Explicit and adopted backedges do not enqueue a Task. Validate
+            // their incoming frame here as well as ordinary queued edges.
+            if let Terminator::Backedge { target } = &terminator {
+                incoming_contexts.observe(*target, exit_context);
+                incoming_prefixes.observe(*target, target.vip.is_none()
+                    && NativeJoinPlan::prefix_history(&task.emu));
+                if cut_at.contains(target) && task.emu.guest_ctx.is_none()
+                    && !task.emu.diagnostic_location_homes {
+                    incoming_native.observe(*target,&task.emu,task.incoming_homes.as_deref());
+                }
+                if task.emu.diagnostic_location_homes && cut_at.contains(target) {
+                    incoming_locations.observe(*target,&mut task.emu,task.incoming_homes.as_deref(),&task.value_sets);
+                    #[cfg(test)]
+                    self.record_location_observation(&task, *target, Some(task.id), visited.contains(target), true, &incoming_locations);
+                }
+            }
+            if exit_context.is_err() && matches!(&terminator,
+                Terminator::Jump(_) | Terminator::Branch { .. } | Terminator::Switch { .. }
+                | Terminator::Adopted { .. } | Terminator::AdoptedSwitch { .. }
+                | Terminator::Backedge { .. })
+            {
+                incoming_contexts.rejected.insert(task.id);
+            }
+
             if let Terminator::Unresolved { reason } = &terminator {
                 unresolved += 1;
                 if debug_stops && let Some(tag) = stop_tag {
                     eprintln!("  [unresolved] stop={tag} :: {reason}");
+                    // Read-only trace diagnostics. Every decoded address comes
+                    // from an instruction that was actually interpreted; do
+                    // not guess an x86 boundary by subtracting from stop_site.
+                    let tail = std::env::var("TVM_DEBUG_TAIL")
+                        .ok()
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(0)
+                        .min(256);
+                    if tail != 0 {
+                        for reg in [Reg::Rax, Reg::Rsp, Reg::Rbp] {
+                            if let Some(value) = task.emu.state.regs.get(&reg) {
+                                eprintln!("    [trace-state] {reg:?}={}", render(&task.emu.arena, *value, 10));
+                            }
+                        }
+                        let mut formatter = iced_x86::IntelFormatter::new();
+                        for ip in task.emu.trace_tail(tail) {
+                            if let Some(instruction) = crate::binary::disasm::decode_at(self.pe, ip) {
+                                let mut text = String::new();
+                                iced_x86::Formatter::format(&mut formatter, &instruction, &mut text);
+                                eprintln!("    [trace-tail] {ip:#x}: {text}");
+                            }
+                        }
+                    }
                 }
                 if diag_on {
                     crate::vm::diag::record_stop(crate::vm::diag::StopDiag {
@@ -593,12 +982,9 @@ impl<'a> Explorer<'a> {
             let mut memo: HashMap<Ref, Ref> = HashMap::new();
             let src = &task.emu.arena;
 
-            // Cut the block's expressions at its own entry by seeding the graft memo with `entry value -> parameter`. Constant entry values are deliberately *not* cut.
-            let mut params: Vec<(crate::ir::expr::Reg, Ref)> = entry_params
-                .iter()
-                .map(|(r, p)| (*r, arena.graft(src, *p, &mut memo)))
-                .collect();
-            params.sort_by_key(|(r, _)| *r as u8);
+            // Retained refs were remapped by run_retaining_entry_params before
+            // this snapshot and the events are grafted through one shared memo.
+            let params = graft_entry_homes(&mut arena, src, block_ref, &entry_params, &mut memo);
 
             let events: Vec<Event> = events
                 .into_iter()
@@ -606,15 +992,8 @@ impl<'a> Explorer<'a> {
                 .collect();
             let terminator = graft_terminator(&mut arena, src, terminator, &mut memo);
             // Guest registers, read out of the VM context rather than from the evaluator's own registers. The evaluator's RSP/R11/RAX belong to the *interpreter* (VM scratch, bytecode base, decode temporaries) and say nothing about guest state.
-            task.emu.ctx_miss = None;
-            // At a guest return the VM has already restored the machine registers.
-            // A proven native indirect tail likewise exits in actual register state,
-            // so neither path may reuse a cached VM register-image interpretation.
-            let guest = if returning || matches!(terminator, Terminator::IndirectTailCall { .. }) {
-                None
-            } else {
-                task.emu.guest_registers()
-            };
+            // `guest` was captured before forking. At a proved native exit it
+            // is None, so the actual restored machine registers are used.
             if self.verbose && guest.is_none() {
                 if let Some((rsp_ok, best)) = task.emu.ctx_miss {
                     eprintln!("     no guest ctx (rsp_slot_ok={rsp_ok}, best_score={best})");
@@ -637,12 +1016,9 @@ impl<'a> Explorer<'a> {
                     .collect(),
             };
             exit_regs.sort_by_key(|(r, _)| *r as u8);
-
-            // Read the continuation target before the terminator is moved.
-            let continuation = match terminator {
-                Terminator::Jump(t) => Some(t),
-                _ => None,
-            };
+            #[cfg(test)]
+            self.location_exit_snapshots.borrow_mut().insert(task.id, (raw_exit_snapshot,
+                exit_regs.iter().map(|&(reg,value)| (reg,expr::render(&arena,value,12))).collect()));
 
             blocks.push(Block {
                 id: task.id,
@@ -656,20 +1032,11 @@ impl<'a> Explorer<'a> {
                 preds: Vec::new(),
             });
 
-            // A plain continuation reuses this evaluator rather than cloning it.
-            // Done after grafting, which borrows the evaluator's arena.
-            if let Some(t) = continuation {
-                let mut ancestors = task.ancestors.clone();
-                ancestors.push(task.id);
-                queue.push(Task {
-                    emu: task.emu,
-                    value_sets: task.value_sets,
-                    resume: t.handler,
-                    id: t,
-                    from: Some(task.id),
-                    ancestors,
-                });
-            }
+            // split_two_way, split_multiway and adopt_known own their queued
+            // successors, including Jump. Enqueuing that Jump again here creates
+            // a false backedge on the next pop and loses selector constraints in
+            // the following recovery pass. Keep the producer's exact snapshot
+            // and path set; do not manufacture a second continuation.
         }
 
         let mut preds: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
@@ -684,9 +1051,29 @@ impl<'a> Explorer<'a> {
             }
         }
 
+        // Entry identity is independent of the outgoing register image. Keep
+        // from_vm_context and the original IDs exactly as recovered.
+        let native_entry_proofs = incoming_prefixes.all_paths(&blocks, entry_id);
         blocks.sort_by_key(|b| b.id);
         back_edges.sort_unstable();
         back_edges.dedup();
+        // Do not let the first incoming path's concrete RSP or register image
+        // authorize code emission when a later path invalidated that premise.
+        unresolved += incoming_contexts.rejected.len();
+        unresolved += incoming_locations.rejected.len();
+        unresolved += incoming_native.rejected.len();
+        if self.verbose {
+            let mut rejected: Vec<_> = incoming_native.rejected.into_iter().collect();
+            rejected.sort_by_key(|(block,_)| *block);
+            for (block,reason) in rejected { eprintln!("     native join rejection at {block}: {reason}"); }
+        }
+        if self.verbose && !incoming_contexts.rejected.is_empty() {
+            let mut rejected: Vec<_> = incoming_contexts.rejected.into_iter().collect();
+            rejected.sort_unstable();
+            for block in rejected {
+                eprintln!("     unproven or conflicting incoming guest context at {block}");
+            }
+        }
         Cfg {
             entry: entry_id,
             arena,
@@ -697,6 +1084,7 @@ impl<'a> Explorer<'a> {
             back_edges,
             trivial_phis_removed: 0,
             stack_base: self.stack_base,
+            native_entry_proofs,
             vm_range: self.vm_range(),
         }
     }
@@ -752,6 +1140,7 @@ impl<'a> Explorer<'a> {
                 resume: id.handler,
                 id,
                 from: Some(task.id),
+                incoming_homes: task.incoming_homes.clone(),
                 ancestors: ancestors.clone(),
             });
         };
@@ -770,15 +1159,23 @@ impl<'a> Explorer<'a> {
                 // be reused here; the successors are what matter for structure.
                 let _ = predicate;
                 resume_at(queue, *taken);
-                resume_at(queue, *not_taken);
+                if not_taken != taken {
+                    resume_at(queue, *not_taken);
+                }
                 Some(Terminator::Adopted {
                     taken: *taken,
                     not_taken: *not_taken,
                 })
             }
             Terminator::Switch { targets, .. } => {
+                // Adoption adds no arm-specific pins. Queue each identical
+                // successor snapshot once, retaining all case slots in the IR.
+                // Handler alone is insufficient: VIP is part of block identity.
+                let mut queued = HashSet::new();
                 for t in targets {
-                    resume_at(queue, *t);
+                    if queued.insert(*t) {
+                        resume_at(queue, *t);
+                    }
                 }
                 Some(Terminator::AdoptedSwitch {
                     targets: targets.clone(),
@@ -930,6 +1327,7 @@ impl<'a> Explorer<'a> {
                     resume: t0,
                     id: id0,
                     from: Some(task.id),
+                    incoming_homes: task.incoming_homes.clone(),
                     ancestors,
                 });
                 return Some(Terminator::Jump(id0));
@@ -948,6 +1346,7 @@ impl<'a> Explorer<'a> {
                 resume: t1,
                 id: id1,
                 from: Some(task.id),
+                incoming_homes: task.incoming_homes.clone(),
                 ancestors: ancestors.clone(),
             });
             queue.push(Task {
@@ -956,6 +1355,7 @@ impl<'a> Explorer<'a> {
                 resume: t0,
                 id: id0,
                 from: Some(task.id),
+                incoming_homes: task.incoming_homes.clone(),
                 ancestors,
             });
             return Some(Terminator::Branch {
@@ -980,7 +1380,7 @@ impl<'a> Explorer<'a> {
             .into_iter()
             .map(|(idx, span)| (idx, span, u64::MAX))
             .collect();
-        for (idx, span, mask) in constrained_byte_indices(&task.emu, dest, &task.value_sets) {
+        for (idx, span, mask) in constrained_indices(&task.emu, dest, &task.value_sets) {
             if let Some(candidate) = indices.iter_mut().find(|(old, _, _)| *old == idx) {
                 candidate.1 = candidate.1.min(span);
                 candidate.2 &= mask;
@@ -1058,6 +1458,7 @@ impl<'a> Explorer<'a> {
                     resume: t,
                     id,
                     from: Some(task.id),
+                    incoming_homes: task.incoming_homes.clone(),
                     ancestors: ancestors.clone(),
                 });
             }
@@ -1430,13 +1831,14 @@ fn graft_terminator(
 /// dispatches select among a handful of VPCs rather than large jump tables.
 const MAX_SWITCH_ARMS: u64 = 63;
 
-/// Derive a byte selector's finite domain from preceding branch predicates.
-/// Each of its 256 values is excluded only by a predicate that evaluates to a
-/// contradictory constant with this byte pinned. Other pins are deliberately
-/// absent from each proof, avoiding self-justification by the predicate itself.
-/// Unknown predicates retain the value. A value above the existing switch limit
-/// that survives any constraint rejects this candidate, never truncates it.
-fn constrained_byte_indices(
+/// Derive a selector's finite domain from preceding branch predicates.
+/// Wide selectors require a proven unsigned upper bound before enumeration;
+/// byte selectors can instead enumerate their entire 256-value domain.
+/// Individual values are excluded only by a contradictory constant predicate.
+/// Other pins are absent, avoiding self-justification by the predicate itself.
+/// Unknown predicates retain the value. A surviving value above the existing
+/// switch limit rejects the candidate instead of truncating its domain.
+fn constrained_indices(
     emu: &Emulator<'_>,
     dest: Ref,
     path_values: &[(Ref, u64)],
@@ -1445,21 +1847,35 @@ fn constrained_byte_indices(
         return Vec::new();
     }
     let mut out = Vec::new();
-    for idx in expr::leaves(&emu.arena, dest)
-        .into_iter()
-        .filter(|r| emu.arena.width(*r) == Width::W8 && !emu.arena.is_const(*r))
-        .take(8)
-    {
+    let mut pending = vec![dest];
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    while let Some(idx) = pending.pop() {
+        if !seen.insert(idx) { continue; }
+        if seen.len() > 2048 { break; }
+        pending.extend(emu.arena.children(idx));
+        if emu.arena.is_const(idx) { continue; }
+        let mut bound = Some(emu.arena.width(idx).mask());
+        for &(predicate, allowed) in path_values {
+            let proof = if allowed == 1 {
+                wide_range::condition_bound(&emu.arena, predicate, false, idx)
+            } else if allowed != 0 && allowed & 1 == 0 {
+                wide_range::condition_bound(&emu.arena, predicate, true, idx)
+            } else { continue; };
+            bound = bound.zip(proof).map(|(a, b)| a.min(b));
+        }
+        if let Some(bound) = bound {
+            if bound <= MAX_SWITCH_ARMS || emu.arena.width(idx) == Width::W8 {
+                candidates.push((idx, bound));
+            }
+        }
+    }
+    candidates.sort_by_key(|(_, bound)| *bound);
+    for (idx, bound) in candidates.into_iter().take(8) {
         // These constraints are widened at every join/backedge and retained
         // across arena compaction. Old emulator pins may describe only one
         // predecessor, so they must never supply a new range proof at a join.
-        let predicates: Vec<_> = path_values
-            .iter()
-            .copied()
-            .filter(|(predicate, _)| {
-                *predicate == idx || expr::leaves(&emu.arena, *predicate).contains(&idx)
-            })
-            .collect();
+        let predicates = path_values;
         if predicates.is_empty() {
             continue;
         }
@@ -1467,7 +1883,7 @@ fn constrained_byte_indices(
         probe.pins.clear();
         let mut values = 0u64;
         let mut bounded = true;
-        for value in 0..=u8::MAX as u64 {
+        for value in 0..=bound {
             let excluded = predicates.iter().any(|&(predicate, allowed)| {
                 probe
                     .probe_pin(idx, value, predicate)
@@ -1853,6 +2269,7 @@ pub fn validate(cfg: &Cfg) -> CfgIssues {
             b.id != cfg.entry
                 && b.from_vm_context
                 && b.id.vip.is_none()
+                && !cfg.native_entry_proofs.contains(&b.id)
                 && (cfg.vm_range.0..cfg.vm_range.1).contains(&b.id.handler)
         })
         .map(|b| b.id)
@@ -1999,7 +2416,7 @@ mod dom_tests {
             trivial_phis_removed: 0,
             timed_out: false,
             stack_base: STACK_BASE,
-            vm_range: (0, 0),
+            native_entry_proofs: Default::default(), vm_range: (0, 0),
         }
     }
 
@@ -2081,7 +2498,7 @@ mod dom_tests {
                 trivial_phis_removed: 0,
                 timed_out: false,
                 stack_base: STACK_BASE,
-                vm_range: (0, 0),
+                native_entry_proofs: Default::default(), vm_range: (0, 0),
             }
         };
 
@@ -2135,7 +2552,7 @@ mod dom_tests {
             trivial_phis_removed: 0,
             timed_out: false,
             stack_base: STACK_BASE,
-            vm_range: (0, 0),
+            native_entry_proofs: Default::default(), vm_range: (0, 0),
         };
         let issues = validate(&half);
         assert_eq!(
@@ -2397,6 +2814,7 @@ mod switch_range_tests {
                     vip: None,
                 },
                 from: None,
+                incoming_homes: None,
                 ancestors: vec![],
             },
             idx,
@@ -2440,7 +2858,7 @@ mod switch_range_tests {
         let pe = table_pe(&[0, 0, 0, 0x1000, 0x1010, 0x1020]);
         let (mut task, idx, dest) = byte_task(&pe, 3, 6);
         assert_eq!(
-            constrained_byte_indices(&task.emu, dest, &task.value_sets),
+            constrained_indices(&task.emu, dest, &task.value_sets),
             vec![(idx, 5, 0b111000)]
         );
         let ex = Explorer::new(&pe, crate::vm::DEFAULT_STACK_BASE);
@@ -2476,7 +2894,7 @@ mod switch_range_tests {
     fn byte_constraints_reject_unknown_upper_domain_and_widen_at_joins() {
         let pe = table_pe(&[]);
         let (task, _, dest) = byte_task(&pe, 3, 200);
-        assert!(constrained_byte_indices(&task.emu, dest, &task.value_sets).is_empty());
+        assert!(constrained_indices(&task.emu, dest, &task.value_sets).is_empty());
         let (mut task, _, dest) = byte_task(&pe, 3, 6);
         task.emu.pins = task
             .value_sets
@@ -2486,7 +2904,7 @@ mod switch_range_tests {
         // A merged block clears path value sets. Its stale evaluator pins must
         // not manufacture a bound that only held for the first predecessor.
         task.value_sets.clear();
-        assert!(constrained_byte_indices(&task.emu, dest, &task.value_sets).is_empty());
+        assert!(constrained_indices(&task.emu, dest, &task.value_sets).is_empty());
     }
 
     #[test]
@@ -2497,7 +2915,44 @@ mod switch_range_tests {
             panic!()
         };
         let next = task.emu.arena.load_at(addr, Width::W8, generation + 1);
-        assert!(constrained_byte_indices(&task.emu, next, &task.value_sets).is_empty());
+        assert!(constrained_indices(&task.emu, next, &task.value_sets).is_empty());
+    }
+
+    #[test]
+    fn wide_unsigned_range_proves_every_possible_index() {
+        let pe = table_pe(&[0x1000, 0x1010, 0x1020, 0x1030]);
+        let (mut task, _, _) = table_task(&pe, 3);
+        let input = task.emu.arena.init_reg(Reg::Rdx);
+        let narrow = task.emu.arena.trunc(input, Width::W32);
+        let adjustment = task.emu.arena.constant(0xffedffff, Width::W32);
+        let idx = task.emu.arena.bin(BinOp::Add, narrow, adjustment);
+        let limit = task.emu.arena.constant(3, Width::W32);
+        let cf = task.emu.arena.bin(BinOp::Ult, idx, limit);
+        let zf = task.emu.arena.bin(BinOp::Eq, idx, limit);
+        let cf64 = task.emu.arena.zext(cf, Width::W64);
+        let zf64 = task.emu.arena.zext(zf, Width::W64);
+        let shift = task.emu.arena.constant(6, Width::W64);
+        let zflag = task.emu.arena.bin(BinOp::Shl, zf64, shift);
+        let flags = task.emu.arena.bin(BinOp::Or, cf64, zflag);
+        let flags32 = task.emu.arena.trunc(flags, Width::W32);
+        let zero = task.emu.arena.constant(0, Width::W32);
+        let above = task.emu.arena.bin(BinOp::Eq, flags32, zero);
+        task.value_sets = vec![(above, 1)];
+        let wide = task.emu.arena.zext(idx, Width::W64);
+        let eight = task.emu.arena.constant(8, Width::W64);
+        let offset = task.emu.arena.bin(BinOp::Mul, wide, eight);
+        let base = task.emu.arena.constant(0x2000, Width::W64);
+        let address = task.emu.arena.bin(BinOp::Add, base, offset);
+        let dest = task.emu.arena.load(address, Width::W64);
+        assert!(constrained_indices(&task.emu, dest, &task.value_sets)
+            .contains(&(idx, 3, 0b1111)));
+        let ex = Explorer::new(&pe, crate::vm::DEFAULT_STACK_BASE);
+        let mut queue = vec![];
+        assert!(matches!(ex.split_multiway(&mut task, 0x1000, dest, &mut queue, None),
+            Some(Terminator::Switch { .. })));
+        assert_eq!(queue.len(), 4);
+        task.value_sets.clear();
+        assert!(constrained_indices(&task.emu, dest, &task.value_sets).is_empty());
     }
 
     #[test]

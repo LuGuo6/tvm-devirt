@@ -12,7 +12,9 @@ pub(crate) fn control_width(b: &SchedBlock, ctrl: &Operand) -> Width {
             Instr::Bin { dst, width, .. }
             | Instr::Un { dst, width, .. }
             | Instr::Select { dst, width, .. }
-            | Instr::Load { dst, width, .. } => (dst, *width),
+            | Instr::Load { dst, width, .. }
+            | Instr::Opaque { dst, width, .. } => (dst, *width),
+            Instr::FunctionInput { dst, .. } | Instr::ReadCallHome { dst, .. } => (dst, Width::W64),
             Instr::Cast { dst, to, .. } => (dst, *to),
             _ => continue,
         };
@@ -438,6 +440,39 @@ pub(crate) fn emit_instr(
     redirect: &CallRedirects,
 ) -> Result<()> {
     match instr {
+        Instr::ReadCallHome { dst, slot } => {
+            let d = layout.call_home_disp(*slot)
+                .ok_or_else(|| anyhow::anyhow!("no function call home for slot {slot}"))? as i32;
+            match alloc.loc_at(Item::Val(*dst), pos) {
+                Some(Loc::Reg(r)) => asm.mov(qreg(r), qword_ptr(rsp + d))?,
+                Some(Loc::Spill(i)) => with_spilled_dst(
+                    asm, layout, i, Width::W64, alloc, pos,
+                    |asm, scratch| { asm.mov(qreg(scratch), qword_ptr(rsp + d))?; Ok(()) },
+                )?,
+                None => {}
+            }
+        }
+        Instr::WriteCallHome { slot, value } => {
+            let d = layout.call_home_disp(*slot)
+                .ok_or_else(|| anyhow::anyhow!("no function call home for slot {slot}"))?;
+            // Reuse the store emitter's register/spill/immediate preservation.
+            // Its Frame operand is synthesized only here, after guest frame
+            // planning, to name this private fixed-RSP displacement exactly.
+            let address = Operand::Frame(d - layout.frame_size as i64);
+            emit_store(asm, alloc, &address, value, 0, Width::W64, pos, layout, img)?;
+        }
+        Instr::FunctionInput { dst, reg } => {
+            let d = layout.input_disp(*reg)
+                .ok_or_else(|| anyhow::anyhow!("no function input snapshot for {reg:?}"))? as i32;
+            match alloc.loc_at(Item::Val(*dst), pos) {
+                Some(Loc::Reg(r)) => asm.mov(qreg(r), qword_ptr(rsp + d))?,
+                Some(Loc::Spill(i)) => with_spilled_dst(
+                    asm, layout, i, Width::W64, alloc, pos,
+                    |asm, scratch| { asm.mov(qreg(scratch), qword_ptr(rsp + d))?; Ok(()) },
+                )?,
+                None => {}
+            }
+        }
         Instr::StackProbe { top, size } => {
             emit_stack_probe(asm, alloc, top, size, pos, layout)?;
         }
@@ -447,6 +482,12 @@ pub(crate) fn emit_instr(
             width,
             at,
         } => {
+            if *tag == "call_ret" && at.is_none() {
+                bail!("call return value has no proven block-entry register home");
+            }
+            if matches!(*tag, "clobbered" | "flag") && at.is_none() {
+                bail!("live uncaptured call output has no proven architectural home: {tag}");
+            }
             // Values with an architectural home already exist in `at`; move them to
             // the allocator-selected location. Boxed result groups are handled by the
             // preceding `Boxed` instruction as a parallel copy.
@@ -573,8 +614,21 @@ pub(crate) fn emit_instr(
         }
 
         Instr::Call { target, args } => {
-            emit_call_args(asm, alloc, args, pos, layout)?;
-            emit_call(asm, alloc, target, pos, img, layout, redirect)?;
+            if let CallTarget::Indirect(op) = target
+                && let Some(Loc::Reg(reg)) = resolve(alloc, op, pos)
+            {
+                // Argument parallel copies may overwrite the target's allocated
+                // register. Preserve the value before those copies. Argument
+                // materialization uses MOV/LEA only and does not use scratch
+                // slots; this slot is dead immediately after the CALL reads it.
+                let saved_target = layout.scratch_slot_disp(3) as i32;
+                asm.mov(qword_ptr(rsp + saved_target), qreg(reg))?;
+                emit_call_args(asm, alloc, args, pos, layout)?;
+                asm.call(qword_ptr(rsp + saved_target))?;
+            } else {
+                emit_call_args(asm, alloc, args, pos, layout)?;
+                emit_call(asm, alloc, target, pos, img, layout, redirect)?;
+            }
         }
         Instr::Select {
             dst,
@@ -1876,12 +1930,10 @@ pub(crate) fn emit_call(
                     asm.mov(r11, qword_ptr(rsp + layout.spill_disp(i) as i32))?;
                     asm.call(r11)?
                 }
-                None => asm.int3()?,
+                None => bail!("indirect call target has no allocated location at instruction {pos}"),
             }
         }
-        CallTarget::Unknown { .. } => {
-            asm.int3()?;
-        }
+        CallTarget::Unknown { site } => bail!("unknown call target at {site:#x}"),
     }
     Ok(())
 }

@@ -25,6 +25,17 @@ use crate::ir::lift::Event;
 use crate::ir::{Block, BlockId, Cfg, Terminator};
 use std::collections::{HashMap, HashSet};
 
+#[path = "call_home.rs"]
+mod call_home;
+
+#[cfg(test)]
+#[path = "schedule_entry_tests.rs"]
+mod schedule_entry_tests;
+
+#[cfg(test)]
+#[path = "schedule_call_home_tests.rs"]
+mod schedule_call_home_tests;
+
 /// A scheduled value: the result of one operation.
 ///
 /// Numbered separately from `Ref` because scheduling assigns each computed value a
@@ -49,7 +60,8 @@ pub enum Operand {
     /// A guest register as it was on entry to this block, i.e. an SSA parameter.
     /// Register allocation resolves these against the block's incoming edges.
     Param(Reg),
-    /// A guest register on entry to the whole function.
+    /// A guest register on entry to this block (legacy manually scheduled IR).
+    /// Whole-function inputs are materialized by `Instr::FunctionInput`.
     Entry(Reg),
     /// A stack location, as a signed offset from RSP on entry to the function. Recovery pins RSP to a concrete `stack_base`, so every stack reference comes out as an absolute address.
     Frame(i64),
@@ -68,6 +80,12 @@ pub struct BoxedMemOp {
 /// One scheduled operation, in three-address form.
 #[derive(Debug, Clone)]
 pub enum Instr {
+    /// Load the immutable value of a GPR on entry to the whole function.
+    /// Its dedicated frame snapshot is populated before any scheduled block.
+    FunctionInput { dst: ValId, reg: Reg },
+    /// Function-private storage for a proven, acyclic cross-block call result.
+    ReadCallHome { dst: ValId, slot: u32 },
+    WriteCallHome { slot: u32, value: Operand },
     /// Ordered stack-page reads; never dead-code eliminated.
     StackProbe { top: Operand, size: Operand },
     /// `dst = a op b`
@@ -215,11 +233,16 @@ pub struct FusedCmp {
 /// How far from the pinned RSP a constant may be and still count as a stack address.
 pub const FRAME_WINDOW: u64 = 0x8000;
 
+#[cfg(test)]
+#[path = "callret_tests.rs"]
+mod callret_tests;
+
 /// Linearize one block.
 pub struct Scheduler<'a> {
     arena: &'a Arena,
     stack_base: u64,
     block: crate::ir::expr::BlockRef,
+    call_homes: Option<&'a call_home::CallHomePlan>,
     /// Values already scheduled, so a shared subexpression is emitted once.
     placed: HashMap<Ref, Operand>,
     instrs: Vec<Instr>,
@@ -231,6 +254,7 @@ impl<'a> Scheduler<'a> {
         Self {
             arena,
             block,
+            call_homes: None,
             stack_base,
             placed: HashMap::new(),
             instrs: Vec::new(),
@@ -300,7 +324,12 @@ impl<'a> Scheduler<'a> {
                 Some(off) => Operand::Frame(off),
                 None => Operand::Imm(c),
             },
-            Op::InitReg(reg) => Operand::Entry(reg),
+            Op::InitReg(Reg::Rsp) => Operand::Frame(0),
+            Op::InitReg(reg) => {
+                let dst = self.fresh();
+                self.instrs.push(Instr::FunctionInput { dst, reg });
+                Operand::Val(dst)
+            }
             Op::Param(owner, reg) => {
                 debug_assert_eq!(
                     owner, self.block,
@@ -309,14 +338,22 @@ impl<'a> Scheduler<'a> {
                 Operand::Param(reg)
             }
             Op::Opaque(tag, _) => {
-                // A `call_ret` reaching here was not produced by any call in this block: the call path below places its opaque directly, so a block-local return value is already in `placed` and never arrives here.
-                if tag == "call_ret" {
-                    return Operand::Entry(Reg::Rax);
+                if tag == "call_ret"
+                    && let Some(origin) = self.arena.call_origin(r)
+                    && let Some(slot) = self.call_homes.and_then(|plan| plan.slot_for(origin))
+                {
+                    let dst = self.fresh();
+                    self.instrs.push(Instr::ReadCallHome { dst, slot });
+                    return Operand::Val(dst);
                 }
+                // A call_ret reaching here has neither a local definition nor a
+                // proven entry home.  Keep it explicit: codegen rejects it rather
+                // than assuming RAX still carries an earlier call's result.
                 let dst = self.fresh();
                 // No architectural home: this is a lazily materialized opaque, reached
-                // because some reader asked for a value nothing defines. Codegen emits
-                // nothing and leaves the register alone.
+                // because some reader asked for a value nothing defines. Codegen
+                // rejects historical call_ret values and live clobbered/flag
+                // values with no proven home.
                 self.instrs.push(Instr::Opaque {
                     dst,
                     tag,
@@ -413,11 +450,12 @@ pub fn schedule(cfg: &Cfg) -> Vec<SchedBlock> {
 
 /// As [`schedule`], also reporting how many instructions DCE removed.
 pub fn schedule_counted(cfg: &Cfg) -> (Vec<SchedBlock>, usize) {
+    let call_homes = call_home::CallHomePlan::build(cfg);
     let mut out: Vec<SchedBlock> = cfg
         .blocks
         .iter()
         .map(|b| {
-            let mut sb = schedule_block(cfg, b);
+            let mut sb = schedule_block_with_homes(cfg, b, &call_homes);
             fold_addressing(&mut sb);
             sb
         })
@@ -439,6 +477,13 @@ pub fn schedule_counted(cfg: &Cfg) -> (Vec<SchedBlock>, usize) {
         // overwritten later, which DSE is then free to delete outright.
         narrow_partially_dead_stores(sb);
         removed += eliminate_dead_with(sb, &escapes);
+    }
+    // Recovery stores blocks by address, which need not put the real entry
+    // first (a native continuation can have a lower address than the VM entry).
+    // The passes above retain the CFG's order for their zip-based correspondence;
+    // the passes below and codegen use index zero as the protected entry/root.
+    if let Some(entry_index) = out.iter().position(|block| block.id == cfg.entry) {
+        out[..=entry_index].rotate_right(1);
     }
     merge_identical_returns(&mut out);
     thread_empty_jumps(&mut out);
@@ -821,7 +866,8 @@ fn entry_read_widths(
                 }
             }
             Instr::StackProbe { top, size } => { note(top, 64); note(size, 64); }
-            Instr::Opaque { .. } => {}
+            Instr::WriteCallHome { value, .. } => note(value, 64),
+            Instr::Opaque { .. } | Instr::FunctionInput { .. } | Instr::ReadCallHome { .. } => {}
         }
     }
     // The branch condition, and the exits.
@@ -921,7 +967,7 @@ fn rename_entry_reads(cfg: &Cfg, blocks: &mut [SchedBlock]) {
         }
 
         let rename = |o: &mut Operand| {
-            if let Operand::Entry(q) | Operand::Param(q) = o {
+            if let Operand::Entry(q) = o {
                 if let Some(&to) = home.get(q) {
                     *o = Operand::Entry(to);
                 }
@@ -1117,7 +1163,12 @@ fn terminal_tail_load(cfg: &Cfg, b: &Block) -> Option<(Ref, Ref)> {
 }
 
 fn schedule_block(cfg: &Cfg, b: &Block) -> SchedBlock {
+    schedule_block_with_homes(cfg, b, &call_home::CallHomePlan::build(cfg))
+}
+
+fn schedule_block_with_homes(cfg: &Cfg, b: &Block, call_homes: &call_home::CallHomePlan) -> SchedBlock {
     let mut s = Scheduler::new(&cfg.arena, b.block_ref, cfg.stack_base);
+    s.call_homes = Some(call_homes);
     let tail_load = terminal_tail_load(cfg, b);
     let tail_register = match b.terminator {
         Terminator::IndirectTailCall { target }
@@ -1156,7 +1207,7 @@ fn schedule_block(cfg: &Cfg, b: &Block) -> SchedBlock {
     // matters: a load's result is often what a register ends up holding, and
     // emitting the effect first means the register reuses that value rather than
     // scheduling a second, identical load.
-    for e in &b.events {
+    for (event_index, e) in b.events.iter().enumerate() {
         if matches!(e, Event::Load { value, .. } if tail_load.is_some_and(|(target, _)| target == *value))
         {
             continue;
@@ -1239,6 +1290,13 @@ fn schedule_block(cfg: &Cfg, b: &Block) -> SchedBlock {
                         at: Some(Reg::Rax),
                     });
                     s.placed.insert(*rv, Operand::Val(dst));
+                    if let Some(origin) = cfg.arena.call_origin(*rv)
+                        && origin.block == b.id && origin.event_index == event_index
+                        && origin.site == *site
+                        && let Some(slot) = call_homes.slot_for(origin)
+                    {
+                        s.instrs.push(Instr::WriteCallHome { slot, value: Operand::Val(dst) });
+                    }
                 }
             }
             Event::Boxed {
@@ -1512,7 +1570,8 @@ fn each_operand(i: &Instr, f: &mut impl FnMut(&Operand)) {
             }
         }
         Instr::StackProbe { top, size } => { f(top); f(size); }
-        Instr::Opaque { .. } => {}
+        Instr::WriteCallHome { value, .. } => f(value),
+        Instr::Opaque { .. } | Instr::FunctionInput { .. } | Instr::ReadCallHome { .. } => {}
     }
 }
 
@@ -1553,7 +1612,8 @@ fn each_operand_mut(i: &mut Instr, f: &mut impl FnMut(&mut Operand)) {
             }
         }
         Instr::StackProbe { top, size } => { f(top); f(size); }
-        Instr::Opaque { .. } => {}
+        Instr::WriteCallHome { value, .. } => f(value),
+        Instr::Opaque { .. } | Instr::FunctionInput { .. } | Instr::ReadCallHome { .. } => {}
     }
 }
 
@@ -1890,7 +1950,8 @@ pub fn analyze_frame_escapes(blocks: &[SchedBlock]) -> FrameEscapes {
                     leak(rhs);
                 }
                 Instr::StackProbe { top, size } => { leak(top); leak(size); }
-                Instr::Opaque { .. } => {}
+                Instr::WriteCallHome { value, .. } => leak(value),
+                Instr::Opaque { .. } | Instr::FunctionInput { .. } | Instr::ReadCallHome { .. } => {}
             }
         }
         // A frame address that leaves the block as a register value escapes: another
@@ -2128,6 +2189,9 @@ pub fn eliminate_dead_with(b: &mut SchedBlock, escapes: &FrameEscapes) -> usize 
                 overwritten_frame.clear();
                 true
             }
+            // Readers may be in another block. Per-block DSE has no proof that
+            // a function-wide definition is dead.
+            Instr::WriteCallHome { .. } => true,
             Instr::Call { .. } | Instr::Boxed { .. } => {
                 overwritten.clear();
                 overwritten_frame.retain(|key| !escapes.may_escape(*key));
@@ -2152,6 +2216,8 @@ pub fn eliminate_dead_with(b: &mut SchedBlock, escapes: &FrameEscapes) -> usize 
             | Instr::Un { dst, .. }
             | Instr::Cast { dst, .. }
             | Instr::Select { dst, .. }
+            | Instr::FunctionInput { dst, .. }
+            | Instr::ReadCallHome { dst, .. }
             | Instr::Opaque { dst, .. } => used.contains(dst),
         };
         keep[i] = live;
@@ -2200,7 +2266,8 @@ pub fn eliminate_dead_with(b: &mut SchedBlock, escapes: &FrameEscapes) -> usize 
                 }
             }
             Instr::StackProbe { top, size } => { note(top); note(size); }
-            Instr::Opaque { .. } => {}
+            Instr::WriteCallHome { value, .. } => note(value),
+            Instr::Opaque { .. } | Instr::FunctionInput { .. } | Instr::ReadCallHome { .. } => {}
         }
     }
 
@@ -2313,6 +2380,9 @@ fn mem(base: String, disp: i64) -> String {
 fn render_instr(i: &Instr) -> String {
     let o = render_operand;
     match i {
+        Instr::FunctionInput { dst, reg } => format!("{dst}:64 = function_input.{}", reg.name()),
+        Instr::ReadCallHome { dst, slot } => format!("{dst}:64 = call_home[{slot}]"),
+        Instr::WriteCallHome { slot, value } => format!("call_home[{slot}] = {value:?}"),
         Instr::Bin {
             dst,
             op,
@@ -2501,7 +2571,7 @@ mod tests {
             trivial_phis_removed: 0,
             timed_out: false,
             stack_base: STACK_BASE,
-            vm_range: (0, 0),
+            native_entry_proofs: Default::default(), vm_range: (0, 0),
         }
     }
 
@@ -3482,7 +3552,7 @@ mod tests {
             trivial_phis_removed: 0,
             timed_out: false,
             stack_base: STACK_BASE,
-            vm_range: (0, 0),
+            native_entry_proofs: Default::default(), vm_range: (0, 0),
         };
 
         // An exit is `(destination, source)`, and the prune keeps or drops it by its
@@ -3582,7 +3652,7 @@ mod tests {
             trivial_phis_removed: 0,
             timed_out: false,
             stack_base: STACK_BASE,
-            vm_range: (0, 0),
+            native_entry_proofs: Default::default(), vm_range: (0, 0),
         };
 
         let mut blocks: Vec<SchedBlock> = cfg
@@ -3679,7 +3749,7 @@ mod tests {
             trivial_phis_removed: 0,
             timed_out: false,
             stack_base: STACK_BASE,
-            vm_range: (0, 0),
+            native_entry_proofs: Default::default(), vm_range: (0, 0),
         };
 
         let mut blocks: Vec<SchedBlock> = cfg
@@ -3756,7 +3826,7 @@ mod tests {
             trivial_phis_removed: 0,
             timed_out: false,
             stack_base: STACK_BASE,
-            vm_range: (0, 0),
+            native_entry_proofs: Default::default(), vm_range: (0, 0),
         };
 
         let mut blocks: Vec<SchedBlock> = cfg
@@ -3842,7 +3912,7 @@ mod tests {
             trivial_phis_removed: 0,
             timed_out: false,
             stack_base,
-            vm_range: (0, 0),
+            native_entry_proofs: Default::default(), vm_range: (0, 0),
         };
         let sb = schedule_one(&cfg, &cfg.blocks[0]);
         let call = sb
@@ -3871,9 +3941,9 @@ mod tests {
         );
     }
 
-    /// A return value from a *predecessor's* call is read as RAX's entry value. Block boundaries are fixed: a successor reads guest register `R` from `R`.
+    /// An opaque with no local call and no entry-home proof must not guess RAX.
     #[test]
-    fn a_return_value_from_a_predecessors_call_reads_rax_at_entry() {
+    fn a_return_value_without_a_proven_entry_home_remains_explicit() {
         let mut arena = crate::ir::expr::Arena::new();
         let stack_base = 0x7ff0_0000_u64;
         // No `Event::Call` in this block: the opaque came from a predecessor.
@@ -3908,18 +3978,19 @@ mod tests {
             trivial_phis_removed: 0,
             timed_out: false,
             stack_base,
-            vm_range: (0, 0),
+            native_entry_proofs: Default::default(), vm_range: (0, 0),
         };
         let sb = schedule_one(&cfg, &cfg.blocks[0]);
         assert!(
-            !sb.instrs.iter().any(|i| matches!(
+            sb.instrs.iter().any(|i| matches!(
                 i,
                 Instr::Opaque {
                     tag: "call_ret",
+                    at: None,
                     ..
                 }
             )),
-            "no call in this block returns anything, so there is no definition to              place here; got {:?}",
+            "an unproven call result must remain visible for codegen rejection; got {:?}",
             sb.instrs
         );
         let addr = sb
@@ -3930,11 +4001,7 @@ mod tests {
                 _ => None,
             })
             .unwrap_or_else(|| panic!("no load scheduled: {:?}", sb.instrs));
-        assert_eq!(
-            addr,
-            Operand::Entry(Reg::Rax),
-            "the pointer arrives in rax at entry, so the load must address it there;              got {addr:?}"
-        );
+        assert!(matches!(addr, Operand::Val(_)), "unproven result became a register guess: {addr:?}");
     }
 
     #[test]

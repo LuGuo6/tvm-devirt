@@ -221,6 +221,11 @@ pub struct FrameLayout {
     /// Callee-saved registers this function writes, in save order. Each gets 8
     /// bytes just above the spill slots.
     saves: Vec<Reg>,
+    /// Immutable function-entry GPR snapshots, distinct from block inputs.
+    inputs: Vec<Reg>,
+    /// Function-wide values with independently proven call origins. Their
+    /// lifetime crosses blocks and cannot use block-local allocator spills.
+    call_home_slots: u32,
     /// Outgoing stack arguments the widest call in this function needs, beyond
     /// the four the ABI passes in registers.
     stack_args: u32,
@@ -258,6 +263,33 @@ impl FrameLayout {
         saves: Vec<Reg>,
         stack_args: u32,
     ) -> Self {
+        Self::with_inputs(frame_lo, spill_slots, has_calls, saves, stack_args, Vec::new())
+    }
+
+    pub fn with_inputs(
+        frame_lo: i64,
+        spill_slots: u32,
+        has_calls: bool,
+        saves: Vec<Reg>,
+        stack_args: u32,
+        inputs: Vec<Reg>,
+    ) -> Self {
+        Self::with_call_homes(frame_lo, spill_slots, has_calls, saves, stack_args, inputs, 0)
+    }
+
+    pub fn with_call_homes(
+        frame_lo: i64,
+        spill_slots: u32,
+        has_calls: bool,
+        saves: Vec<Reg>,
+        stack_args: u32,
+        mut inputs: Vec<Reg>,
+        call_home_slots: u32,
+    ) -> Self {
+        // RSP is represented by Frame(0), never read after frame allocation.
+        assert!(!inputs.contains(&Reg::Rsp));
+        inputs.sort_unstable();
+        inputs.dedup();
         // Bytes needed to cover spills + guest locals. Only offsets *below* entry RSP are local frame the prologue must reserve.
         let locals = frame_lo.min(0).unsigned_abs() as i64;
         // A function that calls must give its callee 32 bytes of shadow space at the very bottom of the frame, because the callee addresses those slots off its own RSP.
@@ -267,6 +299,8 @@ impl FrameLayout {
             + 8 * spill_slots as i64
             + SCRATCH_BYTES
             + 8 * saves.len() as i64
+            + 8 * inputs.len() as i64
+            + 8 * call_home_slots as i64
             + locals;
         // RSP % 16 == 8 at entry (call pushed the return address).
         // After sub rsp, N we want RSP % 16 == 0, so N ≡ 8 (mod 16).
@@ -281,6 +315,8 @@ impl FrameLayout {
             spill_slots,
             shadow: shadow as u32,
             saves,
+            inputs,
+            call_home_slots,
             stack_args,
             img: ImageRange::empty(),
         }
@@ -294,6 +330,24 @@ impl FrameLayout {
 
     pub fn saves(&self) -> &[Reg] {
         &self.saves
+    }
+
+    pub fn inputs(&self) -> &[Reg] {
+        &self.inputs
+    }
+
+    /// Snapshots follow scratch slots and precede guest locals. They are not
+    /// exposed to local dead-store cleanup, since readers may be in any block.
+    pub fn input_disp(&self, r: Reg) -> Option<i64> {
+        let i = self.inputs.iter().position(|&input| input == r)?;
+        Some(self.scratch_slot_disp(0) + SCRATCH_BYTES + 8 * i as i64)
+    }
+
+    /// Call homes follow immutable input snapshots and precede guest locals.
+    /// These stores remain live across basic blocks, outside private_ranges().
+    pub fn call_home_disp(&self, slot: u32) -> Option<i64> {
+        (slot < self.call_home_slots).then(|| self.scratch_slot_disp(0)
+            + SCRATCH_BYTES + 8 * self.inputs.len() as i64 + 8 * slot as i64)
     }
 
     /// Displacement from current RSP for a `Frame(o)` reference.
@@ -320,7 +374,11 @@ impl FrameLayout {
         self.scratch_slot_disp(0)
     }
 
-    /// Displacement of scratch slot `i`, `i < SCRATCH_SLOTS`. Slot 0 is [`scratch_disp`]; the rest belong to [`emit_rdx_rax_op`].
+    /// Displacement of scratch slot `i`, `i < SCRATCH_SLOTS`. Slot 0 is
+    /// [`scratch_disp`]; slots 1..3 preserve registers within `emit_rdx_rax_op`.
+    /// An indirect CALL also uses slot 3 from just before its argument copies
+    /// until the CALL reads its target. Argument MOV/LEA emission does not use
+    /// these slots, and the saved target has no lifetime across scheduled instructions.
     pub fn scratch_slot_disp(&self, i: u32) -> i64 {
         debug_assert!((i as i64) < SCRATCH_SLOTS);
         self.outgoing_end()

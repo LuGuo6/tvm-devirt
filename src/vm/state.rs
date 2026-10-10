@@ -309,6 +309,10 @@ impl State {
         self.symbolic_memory = None;
     }
 
+    pub(crate) fn has_symbolic_forwarding(&self) -> bool {
+        self.symbolic_memory.is_some()
+    }
+
     pub fn store_symbolic(&mut self, arena: &Arena, addr: Ref, value: Ref, width: Width) {
         self.sym_stores.push((addr, value, width));
         let (base, negative, offset) = symbolic_address(arena, addr);

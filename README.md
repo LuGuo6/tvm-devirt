@@ -42,6 +42,18 @@ and marking that section executable:
 tvm-devirt write-devirt input.exe output.exe
 ```
 
+Batch recovery defaults to `min(available logical cores, 8)` workers. Use
+`--cpu-percent 60` to choose `floor(available logical cores * 60 / 100)` workers
+(at least one, up to the available core count); for example, 20 logical cores
+selects 12 workers. This is a concurrency budget, not a hard CPU utilization
+limit: actual usage depends on the functions being recovered and other work on
+the machine. More workers also require more memory. Use `--jobs N` for an
+explicit worker count; it is mutually exclusive with `--cpu-percent`.
+
+```bash
+tvm-devirt write-devirt input.dll output.dll --cpu-percent 60
+```
+
 Diagnose an incomplete function or extend a previous output while still analyzing
 the original input:
 
@@ -49,6 +61,13 @@ the original input:
 tvm-devirt unresolved input.dll 0x180001000 --json unresolved.json
 tvm-devirt write-devirt input.dll next.dll --patch-base previous.dll --only-entry 0x180001000 --max-blocks 1024
 ```
+
+`--timeout` is a wall-clock backstop for each exploration pass. A function may
+need several passes, and the explorer checks time between recovered blocks.
+The total time shown for a function can therefore exceed `--timeout`. For a
+retry of timed-out entries, pass a larger value explicitly, for example
+`--timeout 1800`; the default remains 600 seconds. A larger timeout does not
+resolve missing control-flow edges or values without a proven definition.
 
 Run `tvm-devirt --help` or `tvm-devirt <command> --help` for all options.
 
@@ -89,7 +108,7 @@ flowchart TB
 
 Some operations execute outside the VM. A **boxed instruction** runs its original x86 encoding after the VM restores the registers it needs, then returns its effects to the guest context. A **guest call** invokes a native target and resumes with the return value and Windows x64 ABI clobbers represented in guest state. Guest returns and tail calls leave the dispatcher entirely.
 
-The context contains all sixteen guest general-purpose registers, including the guest `RSP`, plus packed guest flags. The exact context layout can vary, so the lifter identifies the guest register image by observing the VM's register save and restore behavior rather than assuming a single fixed address.
+The context contains all sixteen guest general-purpose registers, including the guest `RSP`, plus packed guest flags. The exact context layout can vary. The default locator uses observed entry spills and register-content scoring over supported layouts; duplicated register images can make this heuristic ambiguous.
 
 Conditional control flow is implemented through dispatch arithmetic. A handler extracts a guest flag or predicate, uses it to select the next virtual program counter, and computes the address of the next native handler. The devirtualizer symbolically evaluates that process and forks the evaluator when the selected path depends on an unresolved guest value.
 
@@ -107,6 +126,25 @@ src/cli/      inspection, recovery, formatting, and writeback commands
 
 - Codegen quality is far from perfect and the output binaries are meant for analysis only.
 - Unsupported or unresolved VM behavior can leave a function incomplete.
+- Emitted Windows unwind data describes the new stack frame. Original exception
+  handlers, cleanup state and PC scope tables are not translated to the new code
+  addresses; preserving the old `.pdata` records does not provide this coverage.
+- Recovery counts, PE structure checks and stack-unwind tests do not establish
+  behavioral equivalence. Validate generated instructions against the original
+  paths, including values preserved across calls and block boundaries.
+- Generated-body stack checks do not cover retained `.tvm0` code. IDA may still
+  report positive SP values when interpreting VM stack switches or dispatch
+  CALLs as ordinary C functions; inspect the failing address and original bytes.
+- `TVM_DIAGNOSTIC_CONTEXT_ORIGIN=1` enables an experimental storage-origin
+  tracker, disabled by default. A complete restore/save round trip does not
+  prove which mirror subsequent VM instructions consume. This mode prints a
+  diagnostic notice and permits `write-devirt` only with one `--only-entry`;
+  its outputs are experiments, excluded from verified recovery counts.
+- `TVM_DIAGNOSTIC_LOCATION_HOMES=1` is a separate experiment for proving exact
+  private storage locations against register homes on every incoming edge.
+  It is disabled by default and mutually exclusive with context-origin mode.
+  Diagnostic writeback requires one `--only-entry`. Passing a scoped comparison
+  does not promote an experimental output to verified recovery.
 
 ## Credits
 

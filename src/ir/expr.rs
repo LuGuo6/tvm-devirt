@@ -7,6 +7,29 @@ use std::num::NonZeroU32;
 
 use crate::ir::hash;
 
+#[path = "bitwise_truth.rs"]
+mod bitwise_truth;
+
+#[cfg(test)]
+#[path = "or_mask_sub_review_tests.rs"]
+mod or_mask_sub_review_tests;
+
+#[cfg(test)]
+#[path = "disjoint_factor_tests.rs"]
+mod disjoint_factor_tests;
+
+#[cfg(test)]
+#[path = "union_sub_review_tests.rs"]
+mod union_sub_review_tests;
+
+#[cfg(test)]
+#[path = "bitwise_truth_tests.rs"]
+mod bitwise_truth_tests;
+
+#[cfg(test)]
+#[path = "call_origin_tests.rs"]
+mod call_origin_tests;
+
 /// Bit width of a value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Width {
@@ -296,6 +319,15 @@ impl NodeKind {
     }
 }
 
+/// Stable definition identity for a recovered call result, independent of the
+/// local arena's opaque counter and of subsequent expression grafts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct CallOrigin {
+    pub block: crate::ir::BlockId,
+    pub event_index: usize,
+    pub site: u64,
+}
+
 /// Hash-consing arena. All expression construction goes through here so that
 /// structural equality is pointer equality. Cloning omits memo caches because they
 /// are derived from immutable nodes.
@@ -307,6 +339,9 @@ pub struct Arena {
     /// 0 and is incremented *before* use, so a generated id is never 0; which is
     /// what lets [`Arena::undef`] reserve 0 for its shared nodes.
     opaque_counter: u32,
+    /// Exact recovered call definitions. These are metadata, not expression
+    /// equality: separate grafts still receive separate opaque nodes.
+    call_origins: HashMap<Ref, CallOrigin>,
     /// Current memory generation, stamped onto every [`Op::Load`].
     ///
     /// Bumped by [`Arena::bump_mem_gen`] whenever the evaluator's memory model
@@ -351,6 +386,7 @@ impl Clone for Arena {
             nodes: self.nodes.clone(),
             intern: self.intern.clone(),
             opaque_counter: self.opaque_counter,
+            call_origins: self.call_origins.clone(),
             mem_gen: self.mem_gen,
             sym_write_gen: self.sym_write_gen,
             concrete_gen: self.concrete_gen.clone(),
@@ -641,6 +677,9 @@ impl Arena {
 
         self.nodes = nodes;
         self.intern = intern;
+        self.call_origins = self.call_origins.iter()
+            .filter_map(|(old, origin)| remap.get(old).map(|new| (*new, *origin)))
+            .collect();
         self.known_zero.clear();
         self.known_one.clear();
         (remap, max_depth)
@@ -739,6 +778,20 @@ impl Arena {
         self.nodes[r.index()].width
     }
 
+    pub(crate) fn call_origin(&self, r: Ref) -> Option<CallOrigin> {
+        self.call_origins.get(&r).copied()
+    }
+
+    pub(crate) fn bind_call_origin(&mut self, r: Ref, origin: CallOrigin) {
+        assert!(matches!(self.op(r), Op::Opaque("call_ret", id) if *id != 0));
+        assert_eq!(self.width(r), Width::W64);
+        if let Some(previous) = self.call_origins.get(&r) {
+            assert_eq!(*previous, origin, "call result acquired conflicting definitions");
+        } else {
+            self.call_origins.insert(r, origin);
+        }
+    }
+
     fn intern(&mut self, node: Node) -> Ref {
         if let Some(&r) = self.intern.get(&node) {
             return r;
@@ -784,6 +837,11 @@ impl Arena {
         let Some(a) = self.as_const(addr) else {
             return self.mem_gen;
         };
+        // A wrapping read also covers low addresses; the cell iterator has a
+        // saturating endpoint. Keep such reads behind the global epoch.
+        if bytes == 0 || a.checked_add(u64::from(bytes) - 1).is_none() {
+            return self.mem_gen;
+        }
         let mut gen_at = self.sym_write_gen;
         for cell in cells(a, bytes) {
             if let Some(g) = self.concrete_gen.get(&cell) {
@@ -799,6 +857,12 @@ impl Arena {
             op: Op::Load(addr, gen_at),
             width,
         })
+    }
+
+    /// A pinned address may expose bytes overwritten after a symbolic read.
+    /// Reuse current byte facts only if no overlapping or unknown write is newer.
+    pub(crate) fn load_version_is_current(&self, addr: Ref, width: Width, gen_at: u32) -> bool {
+        self.load_gen(addr, width.bytes()) <= gen_at
     }
 
     /// Note that guest memory has changed, so later loads cannot intern to earlier
@@ -822,6 +886,56 @@ impl Arena {
     /// load rather than a cell.
     pub fn note_symbolic_store(&mut self) {
         self.sym_write_gen = self.mem_gen;
+    }
+
+    /// Record the full possible interval of a const-base/unsigned-small-offset
+    /// write. Returns false when a global symbolic barrier is still required.
+    /// Uses structural width/mask proofs, not path pins or a presumed stack area.
+    pub(crate) fn note_bounded_symbolic_store(&mut self, addr: Ref, bytes: u32) -> bool {
+        if self.width(addr) != Width::W64 || bytes == 0 || bytes > 4096 {
+            return false;
+        }
+        let (base, offset, is_or) = match *self.op(addr) {
+            Op::Bin(op @ (BinOp::Add | BinOp::Or), x, y) => {
+                if let Some(base) = self.as_const(x) { (base, y, op == BinOp::Or) }
+                else if let Some(base) = self.as_const(y) { (base, x, op == BinOp::Or) }
+                else { return false; }
+            }
+            _ => (0, addr, false),
+        };
+        if self.width(offset) != Width::W64 { return false; }
+        let Some(bound) = self.small_unsigned_bound(offset, 4) else { return false; };
+        // Arena canonicalization writes disjoint-bit additions as OR. Accept
+        // only the same arithmetic relationship, proved from the entire bound.
+        if is_or && base & bound != 0 { return false; }
+        let Some(last_offset) = bound.checked_add(u64::from(bytes) - 1) else { return false; };
+        if base.checked_add(last_offset).is_none() { return false; }
+        // <= 65536 possible starting bytes plus one fixed-width access. The
+        // existing eight-byte cell map deliberately over-approximates aliases.
+        let span = u32::try_from(last_offset + 1).expect("bounded interval fits u32");
+        self.note_concrete_store(base, span);
+        true
+    }
+
+    /// An intrinsic unsigned range proof. A MOVZX into a 32-bit destination
+    /// commonly produces zext64(and32(x, 0xffff)); peel only zero extensions.
+    /// The result is both a numeric upper bound and a possible-set-bit mask;
+    /// the latter property is required by the disjoint OR check above.
+    fn small_unsigned_bound(&self, value: Ref, depth: u32) -> Option<u64> {
+        if matches!(self.width(value), Width::W8 | Width::W16) {
+            return Some(self.width(value).mask());
+        }
+        if depth == 0 { return None; }
+        match *self.op(value) {
+            Op::Zext(inner) if self.width(inner) < self.width(value) => {
+                self.small_unsigned_bound(inner, depth - 1)
+            }
+            Op::Bin(BinOp::And, x, y) => {
+                self.as_const(x).or_else(|| self.as_const(y)).filter(|mask| *mask <= 0xffff)
+            }
+            Op::Const(value) if value <= 0xffff => Some(value),
+            _ => None,
+        }
     }
 
     /// The generation later loads will be stamped with.
@@ -896,7 +1010,13 @@ impl Arena {
                 // Id 0 is `undef`'s shared marker; keep it shared. Any other id is
                 // an identity from `src` and must be reissued here.
                 Op::Opaque(tag, 0) => self.undef(tag, w),
-                Op::Opaque(tag, _) => self.opaque(tag, w),
+                Op::Opaque(tag, _) => {
+                    let value = self.opaque(tag, w);
+                    if let Some(origin) = src.call_origin(cur) {
+                        self.bind_call_origin(value, origin);
+                    }
+                    value
+                },
                 // Preserve parameter identity across grafts; unlike counted opaques,
                 // `(block, reg)` already provides a stable unique key.
                 Op::Param(b, reg) => self.param(b, reg),
@@ -1245,6 +1365,9 @@ impl Arena {
         if let Some(r) = self.simplify_bin(op, a, b, width) {
             return r;
         }
+        if let Some(r) = bitwise_truth::simplify(self, op, a, b, width) {
+            return r;
+        }
         self.intern(Node {
             op: Op::Bin(op, a, b),
             width,
@@ -1352,6 +1475,39 @@ impl Arena {
             }
 
             BinOp::Sub => {
+                // (X|Y)-Y == X&~Y. Y is a bit subset of the union, so
+                // clearing it causes no borrow. Do not cross a width change.
+                if let Some((BinOp::Or, x, y)) = self.as_bin(a) {
+                    if self.width(x) == width && self.width(y) == width
+                        && self.width(b) == width
+                    {
+                        let other = if x == b { Some(y) }
+                            else if y == b { Some(x) } else { None };
+                        if let Some(other) = other {
+                            let complement = self.not(b);
+                            return Some(self.bin(BinOp::And, other, complement));
+                        }
+                    }
+                }
+                // (X|C1)-(X|C2) is constant when every bit where the masks
+                // differ is known in X. Unknown shared bits contribute the
+                // same disjoint integer to each operand and cancel exactly.
+                // This uses bit proofs, never a chosen value for undefined AF.
+                if let (Some((BinOp::Or, x, m1)), Some((BinOp::Or, y, m2))) =
+                    (self.as_bin(a), self.as_bin(b))
+                {
+                    if x == y && self.width(x) == width
+                        && self.width(a) == width && self.width(b) == width
+                    {
+                        if let (Some(c1), Some(c2)) = (self.as_const(m1), self.as_const(m2)) {
+                            let ones = self.known_one(x);
+                            let known = ones | self.known_zero(x);
+                            if (c1 ^ c2) & !known & mask == 0 {
+                                return Some(self.constant((c1 | ones).wrapping_sub(c2 | ones), width));
+                            }
+                        }
+                    }
+                }
                 if cb == Some(0) {
                     return Some(a);
                 }
@@ -1806,6 +1962,31 @@ impl Arena {
             BinOp::Xor => {
                 if a == b {
                     return Some(self.constant(0, width));
+                }
+                // The union partitions into Y and X&~Y. XORing away the
+                // second partition leaves Y. Accept both the raw subtraction
+                // and its eager no-borrow simplification, with exact identities.
+                for (union, residual) in [(a, b), (b, a)] {
+                    if let Some((BinOp::Or, x, y)) = self.as_bin(union) {
+                        if self.width(x) != width || self.width(y) != width
+                            || self.width(residual) != width { continue; }
+                        if let Some((BinOp::Sub, whole, removed)) = self.as_bin(residual) {
+                            if whole == union && (removed == x || removed == y) {
+                                return Some(removed);
+                            }
+                        }
+                        if let Some((BinOp::And, u, v)) = self.as_bin(residual) {
+                            for (kept, complement) in [(u, v), (v, u)] {
+                                if let Op::Un(UnOp::Not, removed) = *self.op(complement) {
+                                    if self.width(kept) == width && self.width(complement) == width
+                                        && ((kept == x && removed == y) || (kept == y && removed == x))
+                                    {
+                                        return Some(removed);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 // (A&B) ^ (A|B) == A ^ B
                 //
@@ -2278,7 +2459,11 @@ impl Arena {
 
     /// Whether `a` and `b` provably share no live bit.
     fn disjoint_by_factors(&self, a: Ref, b: Ref) -> bool {
-        if !self.may_have_factors(a) || !self.may_have_factors(b) {
+        // A single leaf can contradict a factor on the other side, e.g.
+        // X and (Y & ~X). Both operands need the same bit-vector width.
+        if self.width(a) != self.width(b)
+            || (!self.may_have_factors(a) && !self.may_have_factors(b))
+        {
             return false;
         }
         let (fa, _) = self.and_factors(a);
@@ -3965,6 +4150,57 @@ mod symbolic_dispatch_tests {
         let zero = a.constant(0, Width::W32);
         let predicate = a.bin(BinOp::Eq, tested, zero);
         assert_eq!(a.as_const(predicate), Some(0));
+    }
+
+    #[test]
+    fn subtract_common_or_masks_cancels_unknown_af() {
+        for width in [Width::W8, Width::W16, Width::W32, Width::W64] {
+            let mut a = Arena::new();
+            let af = a.undef("af_undef", Width::W8);
+            let af = a.zext(af, width);
+            let one = a.constant(1, width);
+            let bit = a.bin(BinOp::And, af, one);
+            let four = a.constant(4, width);
+            let x = a.bin(BinOp::Shl, bit, four);
+            let lo = a.constant(2, width);
+            let hi = a.constant(width.mask() ^ 0x3d, width);
+            let lhs = a.bin(BinOp::Or, x, lo);
+            let rhs = a.bin(BinOp::Or, x, hi);
+            let difference = a.bin(BinOp::Sub, lhs, rhs);
+            assert_eq!(a.as_const(difference), Some(0x40));
+            let masked = a.bin(BinOp::And, lhs, difference);
+            assert_eq!(a.as_const(masked), Some(0));
+        }
+    }
+
+    #[test]
+    fn subtract_common_or_masks_matches_wrapping_values() {
+        for width in [Width::W8, Width::W16, Width::W32, Width::W64] {
+            for unknown in [0, 1, 0x10, 0x55, 0xff] {
+                for set in [0, 2, 0x80] {
+                    for (c1, c2) in [(2, 0xc2), (0x12, 0xf2), (0x55, 0xaa), (0, width.mask())] {
+                        let mut a = Arena::new();
+                        let input = a.init_reg(Reg::Rax);
+                        let input = a.trunc(input, width);
+                        let mask = a.constant(unknown, width);
+                        let x = a.bin(BinOp::And, input, mask);
+                        let fixed = a.constant(set, width);
+                        let x = a.bin(BinOp::Or, x, fixed);
+                        let k1 = a.constant(c1, width);
+                        let k2 = a.constant(c2, width);
+                        let lhs = a.bin(BinOp::Or, x, k1);
+                        let rhs = a.bin(BinOp::Or, x, k2);
+                        let got = a.bin(BinOp::Sub, lhs, rhs);
+                        for value in 0..=255 {
+                            let env = HashMap::from([(Reg::Rax, value)]);
+                            let v = (value & unknown) | set;
+                            assert_eq!(tests::eval(&a, got, &env),
+                                (v | c1).wrapping_sub(v | c2) & width.mask());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

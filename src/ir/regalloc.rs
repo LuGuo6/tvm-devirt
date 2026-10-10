@@ -239,8 +239,11 @@ fn defined(i: &Instr) -> Option<ValId> {
         | Instr::Cast { dst, .. }
         | Instr::Select { dst, .. }
         | Instr::Load { dst, .. }
+        | Instr::FunctionInput { dst, .. }
+        | Instr::ReadCallHome { dst, .. }
         | Instr::Opaque { dst, .. } => Some(*dst),
-        Instr::Store { .. } | Instr::Call { .. } | Instr::Boxed { .. } | Instr::StackProbe { .. } => None,
+        Instr::Store { .. } | Instr::Call { .. } | Instr::Boxed { .. }
+        | Instr::StackProbe { .. } | Instr::WriteCallHome { .. } => None,
     }
 }
 
@@ -290,7 +293,8 @@ fn used(i: &Instr) -> Vec<ValId> {
             }
         }
         Instr::StackProbe { top, size } => { push(top); push(size); }
-        Instr::Opaque { .. } => {}
+        Instr::WriteCallHome { value, .. } => push(value),
+        Instr::Opaque { .. } | Instr::FunctionInput { .. } | Instr::ReadCallHome { .. } => {}
     }
     v
 }
@@ -466,7 +470,8 @@ fn entry_regs_read(i: &Instr) -> Vec<Reg> {
             }
         }
         Instr::StackProbe { top, size } => { push(top); push(size); }
-        Instr::Opaque { .. } => {}
+        Instr::WriteCallHome { value, .. } => push(value),
+        Instr::Opaque { .. } | Instr::FunctionInput { .. } | Instr::ReadCallHome { .. } => {}
     }
     v
 }

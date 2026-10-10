@@ -5,6 +5,10 @@ use iced_x86::{
 };
 use iced_x86::{InstructionInfoFactory, OpAccess};
 
+#[cfg(test)]
+#[path = "function_input_tests.rs"]
+mod function_input_tests;
+
 /// Callee-saved registers written by the emitted function, in ABI order.
 ///
 /// The scan covers allocated segments, split copies, and boundary moves. RSP is
@@ -446,7 +450,15 @@ pub fn plan_frame(blocks: &[SchedBlock], allocs: &[Alloc]) -> FrameLayout {
     // The widest call in the function decides the outgoing argument area, since one
     // region at the bottom of the frame serves every call site.
     let stack_args = blocks.iter().map(sched::stack_arg_count).max().unwrap_or(0);
-    FrameLayout::full(frame_lo, spill_slots, has_calls, saves, stack_args)
+    let inputs = blocks.iter().flat_map(|b| &b.instrs).filter_map(|i| {
+        if let Instr::FunctionInput { reg, .. } = i { Some(*reg) } else { None }
+    }).collect();
+    let call_home_slots = blocks.iter().flat_map(|b| &b.instrs).filter_map(|i| match i {
+        Instr::ReadCallHome { slot, .. } | Instr::WriteCallHome { slot, .. } => Some(*slot),
+        _ => None,
+    }).max().map_or(0, |slot| slot.checked_add(1).expect("call-home slot count overflow"));
+    FrameLayout::with_call_homes(frame_lo, spill_slots, has_calls, saves, stack_args,
+        inputs, call_home_slots)
 }
 
 /// Emit a function with no call redirection.
@@ -464,15 +476,23 @@ pub fn emit_function(
 }
 
 pub fn emit_function_full(
-    _cfg: &Cfg,
+    cfg: &Cfg,
     blocks: &[SchedBlock],
     allocs: &[Alloc],
     base_va: u64,
     pe: &PeFile,
     redirect: &CallRedirects,
 ) -> Result<EmittedFn> {
+    // write-devirt checks these before scheduling; the direct devirt path must
+    // honor them too, including failed proofs discovered on a late CFG edge.
+    if cfg.timed_out || cfg.unresolved != 0 {
+        bail!("recovery is incomplete (timed_out={}, unresolved={})", cfg.timed_out, cfg.unresolved);
+    }
     if blocks.is_empty() {
         bail!("no blocks to emit");
+    }
+    if blocks[0].id != cfg.entry {
+        bail!("scheduled entry {} does not match recovered entry {}", blocks[0].id, cfg.entry);
     }
     let img = ImageRange::of(pe);
 
@@ -503,6 +523,14 @@ pub fn emit_function_full(
         let d = layout
             .save_disp(r)
             .expect("save slot for a register in saves()");
+        asm.mov(qword_ptr(rsp + d as i32), qreg(r))?;
+    }
+
+    // None of the prologue operations above change GPRs other than RSP. Capture
+    // inputs once, before block labels, so back edges never overwrite them.
+    // These are ordinary stores, not unwind operations or callee-save slots.
+    for &r in layout.inputs() {
+        let d = layout.input_disp(r).expect("function input snapshot slot");
         asm.mov(qword_ptr(rsp + d as i32), qreg(r))?;
     }
 

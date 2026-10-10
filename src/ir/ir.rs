@@ -145,6 +145,9 @@ pub struct Cfg {
     /// the recovered code is an absolute address derived from it, and lowering must
     /// turn those back into RSP-relative form, so the anchor has to travel with the CFG.
     pub stack_base: u64,
+    /// Blocks entered before any VM context through complete native histories
+    /// on every incoming path. This is separate from exit-register provenance.
+    pub native_entry_proofs: HashSet<BlockId>,
     /// Half-open VA range of the section holding VM bytecode. Validation needs it to tell a VM handler from a native address. Handlers are shared by construction; one dispatcher serves every branch in a function; so a handler without a bytecode position is ambiguous.
     pub vm_range: (u64, u64),
 }
@@ -191,6 +194,9 @@ impl Cfg {
         loop {
             let mut map: HashMap<Ref, Ref> = HashMap::new();
             for phi in self.phis() {
+                if phi.incoming.iter().any(|(_, value)| value.is_none()) {
+                    continue;
+                }
                 let mut vals: Vec<Ref> = phi
                     .incoming
                     .iter()
@@ -204,6 +210,15 @@ impl Cfg {
                 // to recover, and inventing a value would be a lie.
                 if let [only] = vals[..] {
                     if only != phi.param {
+                        // A block parameter also names its architectural entry
+                        // home.  Replacing it with a past load/call result (or a
+                        // foreign block parameter) loses that storage proof and
+                        // asks the local scheduler to recreate a historical value.
+                        if expr::leaves(&self.arena, only).iter().any(|leaf| {
+                            matches!(self.arena.op(*leaf), expr::Op::Load(..) | expr::Op::Opaque(..) | expr::Op::Param(..))
+                        }) {
+                            continue;
+                        }
                         map.insert(phi.param, only);
                     }
                 }
@@ -374,7 +389,7 @@ mod indirect_tail_tests {
             trivial_phis_removed: 0,
             timed_out: false,
             stack_base: 0x7000_0000,
-            vm_range: (0, 0),
+            native_entry_proofs: Default::default(), vm_range: (0, 0),
         };
         cfg.remove_dead_params();
         assert_eq!(cfg.blocks[0].params, vec![(Reg::Rcx, param)]);

@@ -26,3 +26,6 @@ pub(crate) use unwind::*;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod call_home_tests;
