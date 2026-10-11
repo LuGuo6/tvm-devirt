@@ -571,6 +571,8 @@ const TRACE_TAIL_CAP: usize = 4096;
 
 #[derive(Clone)]
 pub struct Emulator<'a> {
+    /// Optional source-PC exception audit shared by every recovery fork.
+    pub(crate) source_protection: Option<crate::binary::protection::SourceProtection>,
     pub pe: &'a PeFile,
     pub arena: Arena,
     pub state: State,
@@ -699,6 +701,7 @@ impl<'a> Emulator<'a> {
             .unwrap_or((0, 0));
         Self {
             pe,
+            source_protection: None,
             arena,
             state,
             events: Vec::new(),
@@ -2228,6 +2231,16 @@ impl<'a> Emulator<'a> {
         let Some(inst) = disasm::decode_at(self.pe, ip) else {
             return Step::Stopped(Stop::Unreadable { site: ip });
         };
+        if self
+            .source_protection
+            .as_ref()
+            .is_some_and(|audit| !audit.observe(ip, inst.len()))
+        {
+            return Step::Stopped(Stop::Unsupported {
+                site: ip,
+                text: "untranslated or unknown source exception metadata".into(),
+            });
+        }
         self.track_context_instruction(&inst);
         self.steps += 1;
         NativeJoinPlan::record_step(self, &inst);
@@ -2804,6 +2817,22 @@ impl<'a> Emulator<'a> {
                     if target.is_some_and(|t| is_tvm_stack_probe(self.pe, t))
                         && self.stack_probe_summary_enabled()
                     {
+                        // This exact-body summary skips all helper step() calls.
+                        // Inspect its complete source extent, including handlers
+                        // which begin in the middle of the recognized body.
+                        let helper = target.expect("recognized helper target");
+                        if self
+                            .source_protection
+                            .as_ref()
+                            .is_some_and(|audit| !audit.observe(helper, TVM_STACK_PROBE.len()))
+                        {
+                            return Step::Stopped(Stop::Unsupported {
+                                site: helper,
+                                text:
+                                    "untranslated or unknown summarized-helper exception metadata"
+                                        .into(),
+                            });
+                        }
                         self.native_effects_complete = false; self.native_prefix_complete = false;
                         self.context_tracker.invalidate();
                         // Summarize the complete CALL/helper/RET sequence. The

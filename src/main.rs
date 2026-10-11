@@ -176,9 +176,12 @@ enum Cmd {
         /// Recover only these discovered entry VAs (repeatable, comma-separated).
         #[arg(long, value_parser = parse_u64, value_delimiter = ',')]
         only_entry: Vec<u64>,
-        /// Append to a compatible derived image while analyzing the original input.
+        /// Byte-identical base only; rebuild derived images from the original input.
         #[arg(long)]
         patch_base: Option<PathBuf>,
+        /// Analysis experiment: allow untranslated source exception handlers (not runtime compatible).
+        #[arg(long)]
+        analysis_only_ignore_eh: bool,
     },
     /// Devirtualize one function into x86 machine code.
     Devirt {
@@ -336,6 +339,7 @@ fn main() -> Result<()> {
             cpu_percent,
             only_entry,
             patch_base,
+            analysis_only_ignore_eh,
         } => cmd_write_devirt(
             &input,
             &output,
@@ -347,6 +351,7 @@ fn main() -> Result<()> {
             cpu_percent,
             &only_entry,
             patch_base.as_deref(),
+            analysis_only_ignore_eh,
         ),
         Cmd::Devirt {
             input,

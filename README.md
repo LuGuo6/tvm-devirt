@@ -35,8 +35,8 @@ tvm-devirt lower input.exe 0x140001000
 tvm-devirt devirt input.exe 0x140001000 --output function.bin
 ```
 
-Devirtualize all recoverable functions, appending code to the last PE section
-and marking that section executable:
+Devirtualize recoverable functions into a new read/execute code section and a
+separate read-only, non-executable exception metadata section:
 
 ```bash
 tvm-devirt write-devirt input.exe output.exe
@@ -54,13 +54,52 @@ explicit worker count; it is mutually exclusive with `--cpu-percent`.
 tvm-devirt write-devirt input.dll output.dll --cpu-percent 60
 ```
 
-Diagnose an incomplete function or extend a previous output while still analyzing
-the original input:
+Diagnose an incomplete function or rebuild selected entries from the original:
 
 ```bash
 tvm-devirt unresolved input.dll 0x180001000 --json unresolved.json
-tvm-devirt write-devirt input.dll next.dll --patch-base previous.dll --only-entry 0x180001000 --max-blocks 1024
+tvm-devirt write-devirt input.dll selected.dll --only-entry 0x180001000 --max-blocks 1024
 ```
+
+The default writeback policy preserves the original entry when its source
+exception metadata contains a language handler or an unsupported/unknown unwind
+record. Screening also covers source instructions explored while recovering the
+body, including discarded paths and summarized stack probes. Language-handler
+scope tables and cleanup state are not translated. The explicit
+`--analysis-only-ignore-eh` experiment bypasses this rejection and records the
+risks; it does not produce a runtime-compatible exception mapping.
+
+Writeback emits each function once at its final address. Generated calls use
+original entry addresses, so rejected entries keep their original behavior.
+All original sections, their file offsets and overlay bytes are preserved. The
+writer rejects images without enough unused section-header space. A batch with
+zero emitted bodies produces an exact byte copy of the input.
+
+Every output has a companion `output.dll.layout.json` with input/output hashes,
+per-entry outcomes and byte-bound code/unwind/table ranges, plus
+`output.dll.ida.py`. In IDA, run that script after analysis to reveal exact PE
+entry/export functions which IDA hid as library code. The script validates the
+file and loaded-byte hashes, changes only function visibility, and reports
+before/after flags and stack checks. It does not fix PE bytes or translate EH.
+Existing output or sidecar files are never overwritten. Derived `--patch-base` images are currently
+rejected: rebuild from the original so earlier unsafe redirects and exception
+metadata cannot silently carry into a new output. A byte-identical base is
+accepted. These checks establish structure and provenance, not full behavioral
+equivalence.
+
+For an independent fresh IDA database, run `scripts/validate_fresh_ida.py` with
+an IDA-enabled Python environment (`idapro`/idalib and Hex-Rays):
+
+```bash
+python scripts/validate_fresh_ida.py --input output.dll --manifest output.dll.layout.json --output-dir ida-validation
+```
+
+The output directory must be new. The script copies the DLL, saves a separate
+database, checks metadata permissions, function ownership and stack analysis,
+and decompiles a bounded sample of functions smaller than 64 KiB. It preserves
+failures instead of patching stack deltas or suppressing warnings. IDA's global
+autoanalysis may remain unfinished; that is recorded separately from scoped
+checks. `DllEntryPoint` and original VM code may require their own analysis.
 
 `--timeout` is a wall-clock backstop for each exploration pass. A function may
 need several passes, and the explorer checks time between recovered blocks.

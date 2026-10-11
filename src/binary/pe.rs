@@ -1,5 +1,5 @@
-use anyhow::{Context, Result, bail};
 use crate::binary::pe_format as fmt;
+use anyhow::{Context, Result, bail};
 
 #[derive(Debug, Clone)]
 pub struct Section {
@@ -275,49 +275,96 @@ impl PeFile {
     }
 
     pub fn function_table(&self) -> Vec<(u64, u64)> {
-        let mut out: Vec<(u64, u64)> = Vec::new();
-
+        // The exception data directory is the loader-owned source of truth.
+        // Never scan a section named `.pdata`: its tail can contain padding,
+        // stale records, unwind payloads, or unrelated read-only data.
         let o = fmt::data_directory_offset(
             self.opt_header_offset,
             fmt::IMAGE_DIRECTORY_ENTRY_EXCEPTION,
         );
-        if let Some(dir) = self.data.get(o..o + fmt::DATA_DIRECTORY_ENTRY_SIZE) {
-            let rva = u32::from_le_bytes([dir[0], dir[1], dir[2], dir[3]]);
-            let size = u32::from_le_bytes([dir[4], dir[5], dir[6], dir[7]]);
-            if rva != 0 && size >= fmt::RUNTIME_FUNCTION_SIZE as u32 {
-                for i in 0..size / fmt::RUNTIME_FUNCTION_SIZE as u32 {
-                    let va = self.rva_to_va(rva) + i as u64 * fmt::RUNTIME_FUNCTION_SIZE as u64;
-                    let Some(b) = self.read_va(va, fmt::RUNTIME_FUNCTION_SIZE) else {
-                        break;
-                    };
-                    if b.len() < fmt::RUNTIME_FUNCTION_SIZE {
-                        break;
-                    }
-                    let begin = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                    let end = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
-                    if begin == 0 {
-                        break;
-                    }
-                    out.push((self.rva_to_va(begin), self.rva_to_va(end)));
+        let parse = || -> Option<Vec<(u64, u64)>> {
+            let count = rd_u32(&self.data, self.opt_header_offset.checked_add(108)?).ok()?;
+            let directories_end = self
+                .opt_header_offset
+                .checked_add(112)?
+                .checked_add((count as usize).checked_mul(fmt::DATA_DIRECTORY_ENTRY_SIZE)?)?;
+            if count <= fmt::IMAGE_DIRECTORY_ENTRY_EXCEPTION as u32
+                || directories_end > self.section_table_offset
+            {
+                return None;
+            }
+            let dir = self
+                .data
+                .get(o..o.checked_add(fmt::DATA_DIRECTORY_ENTRY_SIZE)?)?;
+            let rva = u32::from_le_bytes(dir[..4].try_into().ok()?);
+            let size = u32::from_le_bytes(dir[4..8].try_into().ok()?);
+            let end = rva.checked_add(size)?;
+            if rva == 0
+                || size == 0
+                || rva % 4 != 0
+                || size % fmt::RUNTIME_FUNCTION_SIZE as u32 != 0
+                || end > self.size_of_image
+            {
+                return None;
+            }
+            // Header RVAs are file offsets. Section-backed tables must have one
+            // unambiguous, complete raw mapping; never return a parsed prefix.
+            let mut mappings = Vec::new();
+            if end <= self.size_of_headers {
+                mappings.push(rva as usize);
+            }
+            for section in &self.sections {
+                if rva >= section.virtual_address
+                    && end <= section.virtual_address.checked_add(section.raw_size)?
+                {
+                    mappings.push(
+                        section
+                            .raw_address
+                            .checked_add(rva - section.virtual_address)?
+                            as usize,
+                    );
                 }
             }
-        }
-
-        if let Some(sec) = self.section_by_name(".pdata") {
-            let bytes = self.section_bytes(sec);
+            if mappings.len() != 1 {
+                return None;
+            }
+            let raw = mappings[0];
+            let bytes = self.data.get(raw..raw.checked_add(size as usize)?)?;
+            let mut out = Vec::with_capacity(bytes.len() / fmt::RUNTIME_FUNCTION_SIZE);
+            let mut previous_end = 0u32;
             for chunk in bytes.chunks_exact(fmt::RUNTIME_FUNCTION_SIZE) {
-                let begin = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                let end = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
-                if begin == 0 {
-                    continue;
+                let begin = u32::from_le_bytes(chunk[..4].try_into().ok()?);
+                let finish = u32::from_le_bytes(chunk[4..8].try_into().ok()?);
+                if begin == 0
+                    || begin >= finish
+                    || begin < previous_end
+                    || finish > self.size_of_image
+                {
+                    return None;
                 }
-                out.push((self.rva_to_va(begin), self.rva_to_va(end)));
+                let mut code_mappings = 0;
+                for section in &self.sections {
+                    if section.is_executable()
+                        && begin >= section.virtual_address
+                        && finish <= section.virtual_address.checked_add(section.raw_size)?
+                    {
+                        code_mappings += 1;
+                    }
+                }
+                if code_mappings != 1 {
+                    return None;
+                }
+                previous_end = finish;
+                out.push((
+                    self.image_base.checked_add(u64::from(begin))?,
+                    self.image_base.checked_add(u64::from(finish))?,
+                ));
             }
-        }
-
-        out.sort_unstable();
-        out.dedup();
-        out
+            Some(out)
+        };
+        // This helper only returns authoritative boundaries; the writer's
+        // ExceptionTable parser supplies detailed errors and unwind screening.
+        parse().unwrap_or_default()
     }
 
     fn cstr_at(&self, va: u64) -> Option<String> {
@@ -367,4 +414,123 @@ fn rd_u64(d: &[u8], o: usize) -> Result<u64> {
     Ok(u64::from_le_bytes(
         d.get(o..o + 8).context("truncated u64")?.try_into()?,
     ))
+}
+
+#[cfg(test)]
+mod function_table_tests {
+    use super::*;
+
+    const BASE: u64 = 0x180000000;
+    const DIRECTORY: usize = 0x98 + 112 + 3 * 8;
+    fn put16(data: &mut [u8], off: usize, value: u16) {
+        data[off..off + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    fn put32(data: &mut [u8], off: usize, value: u32) {
+        data[off..off + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    fn record(data: &mut [u8], off: usize, begin: u32, end: u32) {
+        put32(data, off, begin);
+        put32(data, off + 4, end);
+        put32(data, off + 8, 0x2080);
+    }
+    fn fixture() -> PeFile {
+        let mut data = vec![0; 0x800];
+        data[..2].copy_from_slice(b"MZ");
+        put32(&mut data, 0x3c, 0x80);
+        data[0x80..0x84].copy_from_slice(b"PE\0\0");
+        put16(&mut data, 0x84, 0x8664);
+        put16(&mut data, 0x86, 2);
+        put16(&mut data, 0x94, 0xf0);
+        put16(&mut data, 0x98, 0x20b);
+        data[0xb0..0xb8].copy_from_slice(&BASE.to_le_bytes());
+        for (off, value) in [
+            (32, 0x1000),
+            (36, 0x200),
+            (56, 0x3000),
+            (60, 0x400),
+            (108, 16),
+        ] {
+            put32(&mut data, 0x98 + off, value);
+        }
+        for (i, (name, rva, raw, flags)) in [
+            (*b".text\0\0\0", 0x1000, 0x400, 0x60000020),
+            (*b".pdata\0\0", 0x2000, 0x600, 0x40000040),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let off = 0x188 + i * 40;
+            data[off..off + 8].copy_from_slice(&name);
+            for (delta, value) in [(8, 0x200), (12, rva), (16, 0x200), (20, raw), (36, flags)] {
+                put32(&mut data, off + delta, value);
+            }
+        }
+        put32(&mut data, DIRECTORY, 0x2000);
+        put32(&mut data, DIRECTORY + 4, 24);
+        record(&mut data, 0x600, 0x1000, 0x1005);
+        record(&mut data, 0x60c, 0x1020, 0x1025);
+        data[0x680] = 1;
+        PeFile::parse(data).unwrap()
+    }
+    fn expected() -> Vec<(u64, u64)> {
+        vec![
+            (BASE + 0x1000, BASE + 0x1005),
+            (BASE + 0x1020, BASE + 0x1025),
+        ]
+    }
+
+    #[test]
+    fn named_pdata_never_extends_the_declared_exception_directory() {
+        let mut pe = fixture();
+        // Both a plausible extra record and valid-looking unwind bytes are
+        // outside the loader's 24-byte directory. Neither is a function.
+        record(&mut pe.data, 0x618, 0x1040, 0x1050);
+        pe.data[0x690] = 9;
+        put32(&mut pe.data, 0x694, 0x1100);
+        assert_eq!(pe.function_table(), expected());
+    }
+
+    #[test]
+    fn only_the_active_directory_counts_after_table_relocation() {
+        let mut pe = fixture();
+        let records = pe.data[0x600..0x618].to_vec();
+        pe.data[0x300..0x318].copy_from_slice(&records);
+        put32(&mut pe.data, DIRECTORY, 0x300);
+        record(&mut pe.data, 0x600, 0x1080, 0x1090);
+        record(&mut pe.data, 0x60c, 0x10a0, 0x10b0);
+        assert_eq!(pe.function_table(), expected());
+    }
+
+    #[test]
+    fn missing_or_undeclared_directory_does_not_guess_from_section_names() {
+        let mut absent = fixture();
+        absent.data[DIRECTORY..DIRECTORY + 8].fill(0);
+        assert!(absent.function_table().is_empty());
+        let mut undeclared = fixture();
+        put32(&mut undeclared.data, 0x98 + 108, 3);
+        assert!(undeclared.function_table().is_empty());
+    }
+
+    #[test]
+    fn malformed_directories_never_return_partial_or_phantom_tables() {
+        for (rva, size) in [
+            (0x2000, 25),
+            (0x2001, 24),
+            (0x21f4, 24),
+            (0, 24),
+            (0x2000, 0),
+            (0xfffffff0, 24),
+        ] {
+            let mut pe = fixture();
+            put32(&mut pe.data, DIRECTORY, rva);
+            put32(&mut pe.data, DIRECTORY + 4, size);
+            assert!(pe.function_table().is_empty(), "RVA={rva:#x}, size={size}");
+        }
+        let mut unsorted = fixture();
+        record(&mut unsorted.data, 0x60c, 0x1003, 0x1020);
+        assert!(unsorted.function_table().is_empty());
+        let mut backwards = fixture();
+        record(&mut backwards.data, 0x60c, 0x1025, 0x1020);
+        assert!(backwards.function_table().is_empty());
+    }
 }

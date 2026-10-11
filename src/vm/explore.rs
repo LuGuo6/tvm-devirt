@@ -375,6 +375,7 @@ mod divergence_root_tests {
 }
 
 pub struct Explorer<'a> {
+    pub(crate) source_protection: Option<crate::binary::protection::SourceProtection>,
     pe: &'a PeFile,
     stack_base: u64,
     /// Instruction budget per block.
@@ -404,6 +405,7 @@ pub struct Explorer<'a> {
 impl<'a> Explorer<'a> {
     pub fn new(pe: &'a PeFile, stack_base: u64) -> Self {
         Self {
+            source_protection: None,
             pe,
             stack_base,
             step_budget: 500_000,
@@ -437,6 +439,7 @@ impl<'a> Explorer<'a> {
         // reported, and `adopt_known` would match nothing.
         let vip_slot = {
             let mut probe = Emulator::with_vm_section(self.pe, self.stack_base, &self.vm_section);
+            probe.source_protection = self.source_protection.clone();
             probe.discover_vip_slot(start, Self::VIP_PROBE_STEPS)
         };
         // A join first encountered from one predecessor must not keep that
@@ -539,6 +542,7 @@ impl<'a> Explorer<'a> {
                 let mut e = Emulator::with_vm_section(self.pe, self.stack_base, &self.vm_section);
                 #[cfg(test)]
                 if let Some(seed) = &self.test_seed { e = seed.clone(); }
+                e.source_protection = self.source_protection.clone();
                 // Forks clone the evaluator, so setting this on the seed reaches every
                 // block in the pass.
                 e.vip_slot = vip_slot;

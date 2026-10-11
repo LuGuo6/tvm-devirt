@@ -4,7 +4,7 @@ use crate::cli::fmt::resolve_start;
 use crate::{
     binary::pe, binary::writeback, codegen, ir, ir::regalloc, ir::sched, vm::discover, vm::explore,
 };
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use iced_x86::{Decoder, DecoderOptions, Formatter, IntelFormatter};
 
 fn select_jobs(cores: usize, jobs: Option<usize>, cpu_percent: Option<u8>) -> usize {
@@ -32,7 +32,19 @@ pub fn cmd_write_devirt(
     cpu_percent: Option<u8>,
     only_entry: &[u64],
     patch_base: Option<&std::path::Path>,
+    analysis_only_ignore_eh: bool,
 ) -> Result<()> {
+    let mut manifest_name = output.as_os_str().to_os_string();
+    manifest_name.push(".layout.json");
+    let manifest_path = std::path::PathBuf::from(manifest_name);
+    let mut ida_name = output.as_os_str().to_os_string();
+    ida_name.push(".ida.py");
+    let ida_path = std::path::PathBuf::from(ida_name);
+    for path in [output, manifest_path.as_path(), ida_path.as_path()] {
+        if path.try_exists()? {
+            bail!("output already exists; choose a new path: {}", path.display());
+        }
+    }
     let pe = pe::PeFile::load(input)?;
     let mut entries = discover::find_vm_entries(&pe, vm_section);
     if !only_entry.is_empty() {
@@ -61,7 +73,10 @@ pub fn cmd_write_devirt(
         "devirtualizing {} functions… ({jobs} at a time)",
         entries.len()
     );
-    let (out, report) = writeback::write_devirt(
+    eprintln!("source exception policy: {}", if analysis_only_ignore_eh {
+        "analysis-only; untranslated handlers may be lost"
+    } else { "preserve original entries when source exception metadata needs translation" });
+    let (out, report) = writeback::write_devirt_with_policy(
         &pe,
         base.as_ref(),
         &entries,
@@ -70,9 +85,19 @@ pub fn cmd_write_devirt(
         timeout,
         vm_section,
         jobs,
+        analysis_only_ignore_eh,
     )?;
-    std::fs::write(output, &out)?;
+    let output_pe = pe::PeFile::parse(out.clone())?;
+    report.manifest.validate_output(&output_pe)?;
+    let manifest_bytes = serde_json::to_vec_pretty(&report.manifest)?;
+    write_new_files(&[
+        (&manifest_path, &manifest_bytes),
+        (&ida_path, include_bytes!("../../scripts/prepare_ida.py")),
+        (output, &out),
+    ])?;
     println!("wrote {} bytes to {:?}", out.len(), output);
+    println!("layout evidence: {}", manifest_path.display());
+    println!("IDA entry/export visibility helper: {} (run in IDA after analysis)", ida_path.display());
 
     println!(
         "retargeted {}/{} functions",
@@ -108,7 +133,7 @@ pub fn cmd_write_devirt(
     }
 
     println!(
-        "  unwind: {} RUNTIME_FUNCTION records ({} new), exception dir updated",
+        "  unwind: {} RUNTIME_FUNCTION records ({} new)",
         report.pdata_entries, report.pdata_added
     );
     if report.pdata_added != report.retargeted {
@@ -124,9 +149,63 @@ pub fn cmd_write_devirt(
     Ok(())
 }
 
+/// Create companions before the binary; never overwrite an existing path/alias.
+/// On error, remove only files which this invocation successfully created.
+fn write_new_files(files: &[(&std::path::Path, &[u8])]) -> Result<()> {
+    use std::io::Write;
+    let mut created = Vec::new();
+    let result = (|| -> Result<()> {
+        for &(path, bytes) in files {
+            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)
+                .with_context(|| format!("creating {}", path.display()))?;
+            created.push(path);
+            file.write_all(bytes)?;
+            file.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        for path in created.into_iter().rev() { let _ = std::fs::remove_file(path); }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
-    use super::select_jobs;
+    use super::{select_jobs, write_new_files};
+
+    #[test]
+    fn output_pair_never_overwrites_existing_binary_or_sidecar() {
+        let dir = std::env::temp_dir().join(format!("tvm-output-pair-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir(&dir).unwrap();
+        let output = dir.join("result.dll");
+        let sidecar = dir.join("result.dll.layout.json");
+        let script = dir.join("result.dll.ida.py");
+        std::fs::write(&output, b"existing binary").unwrap();
+        assert!(write_new_files(&[(&sidecar, b"report"), (&script, b"script"), (&output, b"replacement")]).is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), b"existing binary");
+        assert!(!sidecar.exists());
+        assert!(!script.exists());
+        std::fs::write(&sidecar, b"existing report").unwrap();
+        assert!(write_new_files(&[(&sidecar, b"report"), (&output, b"replacement")]).is_err());
+        assert_eq!(std::fs::read(&sidecar).unwrap(), b"existing report");
+        std::fs::remove_file(&output).unwrap();
+        std::fs::remove_file(&sidecar).unwrap();
+        std::fs::write(&script, b"existing helper").unwrap();
+        assert!(write_new_files(&[(&sidecar, b"report"), (&script, b"script"), (&output, b"replacement")]).is_err());
+        assert!(!sidecar.exists());
+        assert!(!output.exists());
+        assert_eq!(std::fs::read(&script).unwrap(), b"existing helper");
+        std::fs::remove_file(&script).unwrap();
+        write_new_files(&[(&sidecar, b"new report"), (&script, b"script"), (&output, b"new binary")]).unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), b"new binary");
+        assert_eq!(std::fs::read(&sidecar).unwrap(), b"new report");
+        std::fs::remove_file(output).unwrap();
+        std::fs::remove_file(sidecar).unwrap();
+        std::fs::remove_file(script).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
 
     #[test]
     fn cpu_percent_rounds_down_with_at_least_one_worker() {

@@ -36,18 +36,27 @@ EXE、DLL 和 SYS；工具读取文件进行静态分析，不启动目标程序
 .\target\release\tvm-devirt.exe unresolved .\input.dll 0x180001000 --json .\unresolved.json
 .\target\release\tvm-devirt.exe devirt .\input.dll 0x180001000 --output .\function.bin --dis
 
-# 在已有派生文件上增量追加；第一个参数始终为原始输入。
-.\target\release\tvm-devirt.exe write-devirt .\input.dll .\next.dll --patch-base .\output.dll --only-entry 0x180001000,0x180002000 --max-blocks 1024
+# 从原始输入重建指定入口。
+.\target\release\tvm-devirt.exe write-devirt .\input.dll .\selected.dll --only-entry 0x180001000,0x180002000 --max-blocks 1024 --cpu-percent 60
 ```
 
-请用自己的入口地址替换示例地址。增量输出使用新文件名。`--only-entry`
-可重复或使用逗号分隔，地址必须来自原始输入的入口发现结果。`--patch-base`
-检查映像布局与 VM 节兼容性；它不是完整文件身份或语义一致性的证明，
-基线应由同一份原始文件生成并保留其来源和校验记录。
+请用自己的入口地址替换示例地址。`--only-entry` 可重复或使用逗号分隔，
+地址必须来自原始输入的入口发现结果。2026-10-11 写回修复要求从原始文件
+重建；`--patch-base` 仅接受与输入逐字节相同的文件，派生基线会明确拒绝。
 
-生成代码追加到 PE 最后一个节并设置执行属性，节名可能仍显示为 `.reloc`。
-增量更新不会重定向旧生成函数中已经指向旧 body 的直接调用；重生成已有
-入口时还需审查这些引用，或者从原始输入重新构建整份派生文件。
+新生成代码位于 RX 的 `.tvcode`，异常元数据位于 R/NX 的 `.tvmeta`。
+原节、文件偏移、覆盖层和全部原始 runtime-function 记录保留；节表空位不足
+会拒绝写回。每个函数按最终地址只发射一次，生成调用经过原入口。
+零个函数发射时输出与输入逐字节相同。输出及同名 `.layout.json` 必须使用
+新路径；sidecar 记录输入/输出哈希、入口状态、代码和元数据的精确范围。
+同时生成同名 `.ida.py`，在 IDA 完成分析后运行，用于显示被隐藏的真实 PE
+入口和导出函数；它核验文件/已加载字节哈希，仅修改可见性并记录前后状态，
+保留 LIB、栈分析、函数范围和所有机器码。运行结果另存 JSON。
+
+默认沿恢复路径检查源 PC 的异常元数据，遇语言 handler 或未知格式时保留
+原入口，不把栈 unwind 当作语言异常映射。`--analysis-only-ignore-eh` 仅用于
+明确接受异常映射缺失的分析实验，报告会保留风险。源 PC 检查通过也不代表
+整份 DLL 的运行行为已经等价。
 
 `--steps`、`--max-blocks`、`--timeout` 控制恢复预算，`--jobs` 控制批处理
 并发数。提高预算不保证处理未知 VM 语义。`unresolved` 的诊断耗时不计入
